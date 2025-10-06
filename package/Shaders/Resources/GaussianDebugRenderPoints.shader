@@ -17,6 +17,7 @@ CGPROGRAM
 #pragma use_dxc
 
 #include "GaussianSplatting.hlsl"
+#include "UnityCG.cginc"
 
 struct v2f
 {
@@ -28,10 +29,18 @@ float _SplatSize;
 bool _DisplayIndex;
 int _SplatCount;
 
+StructuredBuffer<uint> _SplatIndexMap; // optional mapping
+uint _UseIndexMapping; // 1 when using octree culling, 0 otherwise
+
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
     v2f o;
+
     uint splatIndex = instID;
+    if (_UseIndexMapping)
+    {
+        splatIndex = _SplatIndexMap[instID];
+    } 
 
     SplatData splat = LoadSplatData(splatIndex);
 
@@ -59,6 +68,7 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 
 half4 frag (v2f i) : SV_Target
 {
+    i.color.rgb = GammaToLinearSpace(i.color.rgb);
     return half4(i.color.rgb, 1);
 }
 ENDCG

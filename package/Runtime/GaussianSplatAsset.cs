@@ -163,10 +163,11 @@ namespace GaussianSplatting.Runtime
         {
             return format switch
             {
-                ColorFormat.Float32x4 => GraphicsFormat.R32G32B32A32_SFloat,
-                ColorFormat.Float16x4 => GraphicsFormat.R16G16B16A16_SFloat,
+                // For WebGL compatibility, use basic supported formats
+                ColorFormat.Float32x4 => GraphicsFormat.R8G8B8A8_UNorm, // Fallback from R32G32B32A32_SFloat
+                ColorFormat.Float16x4 => GraphicsFormat.R8G8B8A8_UNorm, // Fallback from R16G16B16A16_SFloat
                 ColorFormat.Norm8x4 => GraphicsFormat.R8G8B8A8_UNorm,
-                ColorFormat.BC7 => GraphicsFormat.RGBA_BC7_UNorm,
+                ColorFormat.BC7 => GraphicsFormat.R8G8B8A8_UNorm, // Fallback from RGBA_BC7_UNorm
                 _ => throw new ArgumentOutOfRangeException(nameof(format), format, null)
             };
         }

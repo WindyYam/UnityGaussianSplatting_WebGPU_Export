@@ -21,7 +21,7 @@ namespace GaussianSplatting.Runtime
         protected override void Setup(ScriptableRenderContext renderContext, CommandBuffer cmd)
         {
             m_RenderTarget = RTHandles.Alloc(Vector2.one,
-                colorFormat: GraphicsFormat.R16G16B16A16_SFloat, useDynamicScale: true,
+                colorFormat: GraphicsFormat.R8G8B8A8_UNorm, useDynamicScale: true,
                 depthBufferBits: DepthBits.None, msaaSamples: MSAASamples.None,
                 filterMode: FilterMode.Point, wrapMode: TextureWrapMode.Clamp, name: "_GaussianSplatRT");
         }

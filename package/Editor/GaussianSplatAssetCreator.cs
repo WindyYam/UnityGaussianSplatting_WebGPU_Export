@@ -902,7 +902,7 @@ namespace GaussianSplatting.Editor
 
             if (GraphicsFormatUtility.IsCompressedFormat(gfxFormat))
             {
-                Texture2D tex = new Texture2D(width, height, GraphicsFormat.R32G32B32A32_SFloat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.DontUploadUponCreate);
+                Texture2D tex = new Texture2D(width, height, GraphicsFormat.R8G8B8A8_UNorm, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.DontUploadUponCreate);
                 tex.SetPixelData(data, 0);
                 EditorUtility.CompressTexture(tex, GraphicsFormatUtility.GetTextureFormat(gfxFormat), 100);
                 NativeArray<byte> cmpData = tex.GetPixelData<byte>(0);

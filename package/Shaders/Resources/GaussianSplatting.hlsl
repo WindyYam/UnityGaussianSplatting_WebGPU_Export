@@ -53,7 +53,7 @@ void CalcCovariance3D(float3x3 rotMat, out float3 sigma0, out float3 sigma1)
 }
 
 // from "EWA Splatting" (Zwicker et al 2002) eq. 31
-float3 CalcCovariance2D(float3 worldPos, float3 cov3d0, float3 cov3d1, float4x4 matrixV, float4x4 matrixP, float4 screenParams)
+float3 CalcCovariance2D(float3 worldPos, float3 cov3d0, float3 cov3d1, float4x4 matrixV, float4x4 matrixP, float4 screenParams, out float2 center2D)
 {
     float4x4 viewMatrix = matrixV;
     float3 viewPos = mul(viewMatrix, float4(worldPos, 1)).xyz;
@@ -64,10 +64,13 @@ float3 CalcCovariance2D(float3 worldPos, float3 cov3d0, float3 cov3d1, float4x4 
     float tanFovY = rcp(matrixP._m11 * aspect);
     float limX = 1.3 * tanFovX;
     float limY = 1.3 * tanFovY;
+    float focal = screenParams.x * matrixP._m00 / 2;
+
+    float z = viewPos.z;
+    float2 screenPos = float2(focal * viewPos.x / z, focal * viewPos.y / z);
+
     viewPos.x = clamp(viewPos.x / viewPos.z, -limX, limX) * viewPos.z;
     viewPos.y = clamp(viewPos.y / viewPos.z, -limY, limY) * viewPos.z;
-
-    float focal = screenParams.x * matrixP._m00 / 2;
 
     float3x3 J = float3x3(
         focal / viewPos.z, 0, -(focal * viewPos.x) / (viewPos.z * viewPos.z),
@@ -82,6 +85,21 @@ float3 CalcCovariance2D(float3 worldPos, float3 cov3d0, float3 cov3d1, float4x4 
         cov3d0.z, cov3d1.y, cov3d1.z
     );
     float3x3 cov = mul(T, mul(V, transpose(T)));
+
+    // Mean-shift correction terms derived from Taylor expansion around the 3D mean.
+    // IMPORTANT: use view-space covariance Σ_view = W * Σ_world * W^T
+    float3x3 Sv = mul(W, mul(V, transpose(W)));
+    float Vxz = Sv._m02;
+    float Vyz = Sv._m12;
+    float Vzz = Sv._m22;
+    float invZ2 = rcp(z * z);
+    float invZ3 = invZ2 * rcp(z);
+    float2 meanShift = float2(
+        focal * (-Vxz * invZ2 + viewPos.x * Vzz * invZ3),
+        focal * (-Vyz * invZ2 + viewPos.y * Vzz * invZ3)
+    );
+
+    center2D = (screenPos + 2.0 /*2.0*/ * meanShift) * float2(-1, 1) + screenParams.xy * 0.5;
 
     // Low pass filter to make each splat at least 1px size.
     cov._m00 += 0.3;
@@ -609,9 +627,9 @@ SplatData LoadSplatData(uint idx)
 
 struct SplatViewData
 {
-    float4 pos;
-    float2 axis1, axis2;
-    uint2 color; // 4xFP16
+    float4 pos;      // clip-space center position
+    float2 axis1, axis2; // screen-space axes scaled by clip.w/_ScreenParams
+    uint2 color;     // 4xFP16 color/opacity (RGBA) packed
 };
 
 // If we are rendering into backbuffer directly (e.g. HDR off, no postprocessing),
@@ -627,6 +645,12 @@ struct SplatViewData
 // One could hope someday Unity will fix all this upside-down thingy...
 float4 _CameraTargetTexture_TexelSize;
 void FlipProjectionIfBackbuffer(inout float4 vpos)
+{
+    if (_CameraTargetTexture_TexelSize.z == 1.0)
+        vpos.y = -vpos.y;
+}
+
+void FlipMotionIfBackbuffer(inout float2 vpos)
 {
     if (_CameraTargetTexture_TexelSize.z == 1.0)
         vpos.y = -vpos.y;
