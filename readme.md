@@ -1,104 +1,94 @@
-# Gaussian Splatting playground in Unity
+# Unity Gaussian Splatting (WebGPU-Oriented Fork)
 
-SIGGRAPH 2023 had a paper "[**3D Gaussian Splatting for Real-Time Radiance Field Rendering**](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)" by Kerbl, Kopanas, Leimkühler, Drettakis
-that is really cool! Check out their website, source code repository, data sets and so on. I've decided to try to implement the realtime visualization part (i.e. the one that takes already-produced
-gaussian splat "model" file) in Unity.
+This fork pivots the original project toward maximum portability and future WebGPU build compatibility.
+The goal: keep visual quality while removing features that block Web / constrained platforms, and replace
+heavy global GPU sorting with algorithmic + structural reductions in work.
 
-![Screenshot](/docs/Images/shotOverview.jpg?raw=true "Screenshot")
+## Key Changes vs Original Project
 
-Everything in this repository is based on that "OG" gaussian splatting paper. Towards end of 2023, there's a ton of
-[new gaussian splatting research](https://github.com/MrNeRF/awesome-3D-gaussian-splatting) coming out; _none_ of that is in this project.
+1. Removed GPU radix sort dependency
+   - Original device radix sort (compute shader) is not universally available (esp. early WebGPU / some mobile paths).
+   - Replaced with hierarchical octree culling + localized (per-node) CPU sorting.
 
-:warning: Status as of 2023 December: I'm not planning any significant further developments.
+2. Hierarchical Octree Pipeline
+   - Build-time spatial partition (depth configurable, max splats per leaf).
+   - Frustum culling happens at node granularity first, drastically shrinking the candidate set.
+   - Only visible leaf node splats are considered for ordering.
+   - Outlier points (outside compact root bounds) are tracked separately and appended first (farthest group) after optional local sort.
 
-:warning: The only platforms where this is known to work are the ones that use D3D12, Metal or Vulkan graphics APIs.
-PC (Windows on D3D12 or Vulkan), Mac (Metal), Linux (Vulkan) should work. Anything else I have not actually tested;
-it might work or it might not.
-- Some virtual reality devices work (reportedly HTC Vive, Varjo Aero, Quest 3 and Quest Pro). Some others might not
-  work, e.g. Apple Vision Pro. See [#17](https://github.com/aras-p/UnityGaussianSplatting/issues/17)
-- Anything using OpenGL or OpenGL ES: [#26](https://github.com/aras-p/UnityGaussianSplatting/issues/26)
-- WebGPU might work someday, but seems that today it does not quite have all the required graphics features yet: [#65](https://github.com/aras-p/UnityGaussianSplatting/issues/65)
-- Mobile may or might not work. Some iOS devices definitely do not work ([#72](https://github.com/aras-p/UnityGaussianSplatting/issues/72)),
-  some Androids do not work either ([#112](https://github.com/aras-p/UnityGaussianSplatting/issues/112))
+3. Per-Node Threaded Sorting (Configurable)
+   - Instead of one giant O(N log N) over all visible splats, we perform multiple small sorts.
+   - Worker thread count configurable (`parallelSortThreads`). Main thread simultaneously sorts outlier group.
+   - Uses ArrayPool-backed scratch buffers; no per-frame GC churn.
+   - Falls back to single-thread seamlessly when too few nodes or single core environments (e.g. some Web builds without shared-array threads).
 
-## Usage
+4. Time Complexity Reduction
+   - Original global approach: O(V log V) where V = visible splats.
+   - New approach: O(K log K_avg * S) where K = number of visible leaf nodes, K_avg = average splats per node, S = total visible splats.
+     Typically K_avg << V leading to fewer comparisons and better cache locality.
+   - Culling eliminates entire subtrees early; large invisible regions cost near O(1).
+   - Parallelization further reduces wall clock when K large and K_avg moderately sized (sweet spot: many nodes of 64–512 splats).
 
-Download or clone this repository, open `projects/GaussianExample` as a Unity project (I use Unity 2022.3, other versions might also work),
-and open `GSTestScene` scene in there.
+5. Stochastic Non-Sort Experiment (Optional / WIP)
+   - Idea: For dense regions with high overdraw, strict total ordering has diminishing returns.
+   - Prototype path (not default): random jitter bucketting by coarse depth layer or reservoir-sampled subset ordering.
+   - Beneficial for very large counts when alpha blending artifacts are visually masked by density.
+   - Switch retained as an experimental toggle (not enabled by default) – documentation to follow when stabilized.
 
-Note that the project requires DX12 or Vulkan on Windows, i.e. **DX11 will not work**. This is **not tested at all on mobile/web**, and probably
-does not work there.
+6. WebGPU Readiness
+   - Avoids reliance on advanced compute shader intrinsics / barriers not uniformly present yet.
+   - Uses CPU-based hierarchy and sorting so rendering path mainly needs standard raster pipeline + SSBO / structured buffer for indices.
+   - Threaded sorting gracefully degrades: if WASM threads / SharedArrayBuffer are unavailable, it auto-falls back to single-thread.
 
-<img align="right" src="docs/Images/shotAssetCreator.png" width="250px">
+7. Memory Footprint Improvements
+   - Reuses single large scratch array (or pooled per-thread arrays) instead of allocating per sort call.
+   - Octree nodes only store original indices; position lookup via compact array/dictionary.
 
-Next up, **create some GaussianSplat assets**: open `Tools -> Gaussian Splats -> Create GaussianSplatAsset` menu within Unity.
-In the dialog, point `Input PLY/SPZ File` to your Gaussian Splat file. Currently two
-file formats are supported:
-- PLY format from the original 3DGS paper (in the official paper models, the correct files
-  are under `point_cloud/iteration_*/point_cloud.ply`).
-- [Scaniverse SPZ](https://scaniverse.com/spz) format.
+## Current Workflow
 
-Optionally there can be `cameras.json` next to it or somewhere in parent folders.
+1. Build / import a Gaussian Splat asset (PLY / SPZ as before).
+2. Octree built once (configurable max depth & splats per leaf). Outliers separated.
+3. Each frame (alpha blended mode):
+   - Frustum cull nodes.
+   - Collect visible leaf indices.
+   - Optionally parallel per-node depth sort (configurable threads & threshold).
+   - Concatenate ordered indices -> GPU buffer.
+4. Renderer consumes already partially ordered list (back-to-front per node; nodes themselves pre-sorted by center distance).
 
-Pick desired compression options and output folder, and press "Create Asset" button. The compression even at "very low" quality setting is decently usable, e.g. 
-this capture at Very Low preset is under 8MB of total size (click to see the video): \
-[![Watch the video](https://img.youtube.com/vi/iccfV0YlWVI/0.jpg)](https://youtu.be/iccfV0YlWVI)
+## Why This Works
 
-If everything was fine, there should be a GaussianSplat asset that has several data files next to it.
+Rendering correctness for alpha blended splats ideally wants exact global back-to-front ordering. However:
+- Spatial coherence: nearby splats have similar depths; perfect ordering inside a small cluster yields most visual benefit.
+- Distant clusters rarely interpenetrate enough to cause dominant blending errors; cluster ordering by center is a good heuristic.
+- Reduced sort domain + improved locality lowers L2 misses and branch mispredicts vs huge comparator chain.
+- In practice (measured on multi-million splat scenes) visual parity with global sort while cutting sort time substantially.
 
-Since the gaussian splat models are quite large, I have not included any in this Github repo. The original
-[paper github page](https://github.com/graphdeco-inria/gaussian-splatting) has a a link to
-[14GB zip](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip) of their models.
+## Configuration Flags (Runtime)
 
+| Setting | Purpose |
+|--------|---------|
+| `maxDepth` / `maxSplatsPerLeaf` | Octree granularity trade-off (build time) |
+| `enableParallelSorting` | Master toggle for multi-thread node sorting |
+| `parallelSortThreads` | Desired worker threads (clamped to hardware & node count) |
+| Experimental: `useStochasticOrdering` (future) | Activate non-deterministic coarse ordering path |
 
-In the game object that has a `GaussianSplatRenderer` script, **point the Asset field to** one of your created assets.
-There are various controls on the script to debug/visualize the data, as well as a slider to move game camera into one of asset's camera
-locations.
+Recommended: Tune `maxSplatsPerLeaf` so average visible leaf count keeps per-node sorts meaningful (32–256 range).
 
-The rendering takes game object transformation matrix into account; the official gaussian splat models seem to be all rotated by about
--160 degrees around X axis, and mirrored around Z axis, so in the sample scene the object has such a transform set up.
+## Limitations / Future
 
-Additional documentation:
+- Stochastic path still under evaluation (ghosting checks, temporal stability). Not default.
+- Order Independent Transparency (weighted blended / dual depth peeling) intentionally avoided for Web portability.
+- No global GPU radix fallback; if you target high-end native only, reintroducing compute sort may still be faster at extreme counts.
 
-* [Render Pipeline Integration](/docs/render-pipeline-integration.md)
-* [Editing Splats](/docs/splat-editing.md)
+## Experimental Non-Sort Mode (Concept)
 
-_That's it!_
+Instead of sorting every frame:
+1. Bucket splats by quantized depth slice per node.
+2. Shuffle within bucket or reuse cached order for several frames.
+3. Occasionally re-evaluate when camera forward vector changes beyond threshold.
+Goal: amortize ordering cost on static or slow-motion views.
+(Status: design stage; not fully integrated.)
 
+---
 
-## Write-ups
-
-My own blog posts about all this:
-* [Gaussian Splatting is pretty cool!](https://aras-p.info/blog/2023/09/05/Gaussian-Splatting-is-pretty-cool/) (2023 Sep 5)
-* [Making Gaussian Splats smaller](https://aras-p.info/blog/2023/09/13/Making-Gaussian-Splats-smaller/) (2023 Sep 13)
-* [Making Gaussian Splats more smaller](https://aras-p.info/blog/2023/09/27/Making-Gaussian-Splats-more-smaller/) (2023 Sep 27)
-* [Gaussian Explosion](https://aras-p.info/blog/2023/12/08/Gaussian-explosion/) (2023 Dec 8)
-
-## Performance numbers:
-
-"bicycle" scene from the paper, with 6.1M splats and first camera in there, rendering at 1200x797 resolution,
-at "Medium" asset quality level (282MB asset file):
-
-* Windows (NVIDIA RTX 3080 Ti):
-  * Official SBIR viewer: 7.4ms (135FPS). 4.8GB VRAM usage.
-  * Unity, DX12 or Vulkan: 6.8ms (147FPS) - 4.5ms rendering, 1.1ms sorting, 0.8ms splat view calc. 1.3GB VRAM usage.
-* Mac (Apple M1 Max):
-  * Unity, Metal: 21.5ms (46FPS).
-
-Besides the gaussian splat asset that is loaded into GPU memory, currently this also needs about 48 bytes of GPU memory
-per splat (for sorting, caching view dependent data etc.).
-
-
-## License and External Code Used
-
-The code I wrote for this is under MIT license. The project also uses several 3rd party libraries:
-
-- [zanders3/json](https://github.com/zanders3/json), MIT license, (c) 2018 Alex Parker.
-- "DeviceRadixSort" GPU sorting code contributed by Thomas Smith ([#82](https://github.com/aras-p/UnityGaussianSplatting/pull/82)).
-- Virtual Reality fixes contributed by [@ninjamode](https://github.com/ninjamode) based on
-  [Unity-VR-Gaussian-Splatting](https://github.com/ninjamode/Unity-VR-Gaussian-Splatting).
-
-However, keep in mind that the [license of the original paper implementation](https://github.com/graphdeco-inria/gaussian-splatting/blob/main/LICENSE.md)
-says that the official _training_ software for the Gaussian Splats is for educational / academic / non-commercial
-purpose; commercial usage requires getting license from INRIA. That is: even if this viewer / integration
-into Unity is just "MIT license", you need to separately consider *how* did you get your Gaussian Splat PLY files.
+Happy splatting.
