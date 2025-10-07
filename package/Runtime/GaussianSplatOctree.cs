@@ -79,6 +79,15 @@ namespace GaussianSplatting.Runtime
         // Angular threshold for re-sorting: minimum cosine of angle change before re-sort is needed
         // cosine(15°) ≈ 0.966, cosine(30°) ≈ 0.866, cosine(45°) ≈ 0.707
         public float sortDirectionThreshold = 0.9f; // ~25.8° angle change threshold
+        // Simplified outlier sorting strategy:
+        // We keep an average radial distance (ring radius) of outliers from the root center.
+        // Re-sorting occurs only when camera has moved more than (outlierRingRadius * outlierResortMoveFraction).
+        // If the computed ring radius is zero (edge case), we fall back to a small constant.
+        public float outlierResortMoveFraction = 0.1f; // 10% of ring radius movement triggers re-sort
+        public float minOutlierResortDistance = 0.05f; // Fallback minimum distance if radius very small
+        bool m_OthersSorted;            // Track if outliers are currently sorted
+        Vector3 m_LastOthersSortCamPos; // Camera position at last outlier sort
+        float m_OutlierRingRadius;      // Average radial distance of outliers from scene center
 
         public int nodeCount => m_Nodes.Count;
         public int totalSplats => m_SplatInfos.Count;
@@ -195,6 +204,24 @@ namespace GaussianSplatting.Runtime
                     int orig = m_SplatInfos[inCount + i].originalIndex;
                     m_OthersIndices.Add(orig);
                 }
+            }
+            m_OthersSorted = false; // reset outlier sorting state after build
+            m_LastOthersSortCamPos = Vector3.zero;
+            // Compute average outlier ring radius (ignore min/max & extra stats for simplicity)
+            m_OutlierRingRadius = 0f;
+            if (othersCount > 0)
+            {
+                Vector3 center = m_RootBounds.center;
+                double accum = 0.0;
+                for (int i = 0; i < othersCount; i++)
+                {
+                    int orig = m_SplatInfos[inCount + i].originalIndex;
+                    if (m_OriginalIndexToPosition.TryGetValue(orig, out float3 p))
+                    {
+                        accum += Vector3.Distance(center, (Vector3)p);
+                    }
+                }
+                m_OutlierRingRadius = (float)(accum / othersCount);
             }
 
             m_Built = true;
@@ -502,6 +529,9 @@ namespace GaussianSplatting.Runtime
             visibleSplatCount = 0;
             m_Built = false;
             m_OthersIndices.Clear();
+            m_OthersSorted = false;
+            m_LastOthersSortCamPos = Vector3.zero;
+            m_OutlierRingRadius = 0f;
         }
 
         public void Dispose()
@@ -511,16 +541,7 @@ namespace GaussianSplatting.Runtime
 
         /// <summary>
         /// Sort visible splat indices by 3D distance from camera (back-to-front for alpha blending).
-        /// Should be called after CullFrustum and only for alpha blend transparency mode.
-        /// 
-        /// Hierarchical sorting optimization:
-        /// - Performs frustum culling and node-level sorting in one pass
-        /// - Sorts nodes by distance first, then sorts splats within each node by 3D distance
-        /// - Caches sorted state per node based on camera-to-node direction (avoids re-sorting when viewing angle hasn't changed significantly)
-        /// - Uses angular threshold (sortDirectionThreshold) to determine when re-sorting is needed
-        /// - Much more efficient than global sorting for large splat counts
-        /// - Better cache locality and reduced comparisons
-        /// - Persistent sorting state allows selective updates
+        /// Hierarchical sorting optimization.
         /// </summary>
         public void SortVisibleSplatsByDepth(Camera camera)
         {
@@ -540,11 +561,13 @@ namespace GaussianSplatting.Runtime
             }
             else
             {
-                // Sequential path: sort outliers first (they are assumed farthest)
-                if (m_OthersIndices.Count > 1)
-                    SortSplatsInNode(m_OthersIndices, camPosition);
+                // Sequential path: outliers first (they are assumed farthest)
                 if (m_OthersIndices.Count > 0)
+                {
+                    if (ShouldResortOutliers(camPosition))
+                        SortOutliers(camPosition);
                     m_VisibleSplatIndices.AddRange(m_OthersIndices);
+                }
                 for (int i = 0; i < m_VisibleNodeRefs.Count; i++)
                 {
                     var nodeRef = m_VisibleNodeRefs[i];
@@ -595,6 +618,31 @@ namespace GaussianSplatting.Runtime
             }
         }
 
+        bool ShouldResortOutliers(Vector3 camPosition)
+        {
+            if (m_OthersIndices.Count == 0)
+                return false;
+            if (!m_OthersSorted)
+                return true;
+            float baseThreshold = Mathf.Max(minOutlierResortDistance, m_OutlierRingRadius * outlierResortMoveFraction);
+            float sqMove = (camPosition - m_LastOthersSortCamPos).sqrMagnitude;
+            return sqMove >= baseThreshold * baseThreshold;
+        }
+
+        void SortOutliers(Vector3 camPosition)
+        {
+            if (m_OthersIndices.Count > 1)
+                SortSplatsInNode(m_OthersIndices, camPosition);
+            m_OthersSorted = true;
+            m_LastOthersSortCamPos = camPosition;
+        }
+
+        public void SetOutlierResortFraction(float fraction, float minDistance = 0.05f)
+        {
+            outlierResortMoveFraction = Mathf.Max(0f, fraction);
+            minOutlierResortDistance = Mathf.Max(0f, minDistance);
+        }
+
         void ParallelSortVisibleNodes(Vector3 camPosition, bool processOutliersOnMainThread)
         {
             int nodeCount = m_VisibleNodeRefs.Count;
@@ -603,8 +651,8 @@ namespace GaussianSplatting.Runtime
                 // Only potential work is outliers
                 if (processOutliersOnMainThread && m_OthersIndices.Count > 0)
                 {
-                    if (m_OthersIndices.Count > 1)
-                        SortSplatsInNode(m_OthersIndices, camPosition);
+                    if (ShouldResortOutliers(camPosition))
+                        SortOutliers(camPosition);
                     m_VisibleSplatIndices.AddRange(m_OthersIndices);
                 }
                 return;
@@ -626,7 +674,6 @@ namespace GaussianSplatting.Runtime
                         Vector3 oldDirection = (nodeCenter - node.lastSortCameraPosition).normalized;
                         Vector3 newDirection = (nodeCenter - camPosition).normalized;
                         
-                        // Use dot product to check angular change (cosine of angle between vectors)
                         float cosineAngle = Vector3.Dot(oldDirection, newDirection);
                         needsSort = cosineAngle < sortDirectionThreshold;
                     }
@@ -642,8 +689,8 @@ namespace GaussianSplatting.Runtime
                 // No nodes need sorting, just handle outliers
                 if (processOutliersOnMainThread && m_OthersIndices.Count > 0)
                 {
-                    if (m_OthersIndices.Count > 1)
-                        SortSplatsInNode(m_OthersIndices, camPosition);
+                    if (ShouldResortOutliers(camPosition))
+                        SortOutliers(camPosition);
                     m_VisibleSplatIndices.AddRange(m_OthersIndices);
                 }
                 return;
@@ -658,8 +705,8 @@ namespace GaussianSplatting.Runtime
                 // Fallback to sequential - process the filtered nodes
                 if (processOutliersOnMainThread && m_OthersIndices.Count > 0)
                 {
-                    if (m_OthersIndices.Count > 1)
-                        SortSplatsInNode(m_OthersIndices, camPosition);
+                    if (ShouldResortOutliers(camPosition))
+                        SortOutliers(camPosition);
                     m_VisibleSplatIndices.AddRange(m_OthersIndices);
                 }
                 for (int i = 0; i < sortNodeCount; i++)
@@ -710,8 +757,8 @@ namespace GaussianSplatting.Runtime
             // While workers run, handle outliers on main thread
             if (processOutliersOnMainThread && m_OthersIndices.Count > 0)
             {
-                if (m_OthersIndices.Count > 1)
-                    SortSplatsInNode(m_OthersIndices, camPosition);
+                if (ShouldResortOutliers(camPosition))
+                    SortOutliers(camPosition);
                 m_VisibleSplatIndices.AddRange(m_OthersIndices);
             }
             // Join workers
@@ -733,26 +780,21 @@ namespace GaussianSplatting.Runtime
         /// <summary>
         /// Sort splats in a node and mark it as sorted for the current camera view.
         /// </summary>
-        /// <param name="nodeIndex">Index of the node to sort</param>
-        /// <param name="camPosition">Camera position</param>
-        /// <param name="forceSort">Force sorting even if already sorted for this camera position</param>
         public void SortNodeSplats(int nodeIndex, Vector3 camPosition, bool forceSort = false)
         {
             if (nodeIndex < 0 || nodeIndex >= m_Nodes.Count) return;
             var node = m_Nodes[nodeIndex];
             if (node.splatIndices == null || node.splatIndices.Count <= 1) return;
             
-            // Check if already sorted for this camera direction (using angular threshold)
             if (!forceSort && node.isSorted)
             {
                 Vector3 nodeCenter = node.bounds.center;
                 Vector3 oldDirection = (nodeCenter - node.lastSortCameraPosition).normalized;
                 Vector3 newDirection = (nodeCenter - camPosition).normalized;
                 
-                // Use dot product to check angular change (cosine of angle between vectors)
                 float cosineAngle = Vector3.Dot(oldDirection, newDirection);
                 if (cosineAngle >= sortDirectionThreshold)
-                    return; // Direction hasn't changed enough to warrant re-sorting
+                    return;
             }
             
             SortSplatsInNode(node.splatIndices, camPosition);
@@ -761,7 +803,7 @@ namespace GaussianSplatting.Runtime
         }
         
         /// <summary>
-        /// Mark all nodes as needing re-sort (e.g., when camera changes significantly).
+        /// Mark all nodes and outliers as needing re-sort.
         /// </summary>
         public void InvalidateAllSorts()
         {
@@ -769,12 +811,12 @@ namespace GaussianSplatting.Runtime
             {
                 m_Nodes[i].isSorted = false;
             }
+            m_OthersSorted = false;
         }
         
         /// <summary>
         /// Set the sort direction threshold using angle in degrees for easier configuration.
         /// </summary>
-        /// <param name="angleDegrees">Angle threshold in degrees (e.g., 15, 30, 45)</param>
         public void SetSortDirectionThresholdDegrees(float angleDegrees)
         {
             sortDirectionThreshold = Mathf.Cos(angleDegrees * Mathf.Deg2Rad);
