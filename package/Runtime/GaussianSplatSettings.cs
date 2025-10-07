@@ -9,8 +9,6 @@ namespace GaussianSplatting.Runtime
         // no sorting, transparency is stochastic (random) and noisy
         Stochastic,
         // no sorting, transparency is stochastic (half tone) and less noisy
-        StochasticHalfTone,
-        // regular alpha blending, requires sorting for correct results
         AlphaBlend,
     }
 
@@ -77,7 +75,7 @@ namespace GaussianSplatting.Runtime
         public bool m_EnableOctreeCulling = true;
         [Tooltip("Maximum octree depth (4-6 recommended)")]
         [Range(3, 10)] public int m_OctreeMaxDepth = 6;
-        [Tooltip("Maximum splats per octree leaf node (64-256 recommended)")]
+        [Tooltip("Maximum splats per octree leaf node that avoid split (which is still limited by max depth)")]
         [Range(32, 4096)] public int m_OctreeMaxSplatsPerLeaf = 512;
         [Tooltip("Update culling every N frames (1 = every frame, higher = better performance but less precise)")]
         [Range(1, 20)] public int m_OctreeCullingUpdateInterval = 1;

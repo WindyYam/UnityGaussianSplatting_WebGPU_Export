@@ -90,11 +90,11 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
     float3 centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos, 1)).xyz;
     float4 centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
     
-    // Check if behind camera, outside frustum, or outside near/far clip planes
+    // Check if behind camera, outside relaxed frustum, or outside near/far clip planes
     bool behindCam = centerClipPos.w <= 0;
     float2 ndc = centerClipPos.xy / centerClipPos.w;
     float ndcZ = centerClipPos.z / centerClipPos.w;
-    bool outsideFrustum = abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0;
+    bool outsideFrustum = abs(ndc.x) > 1.3 || abs(ndc.y) > 1.3;
     bool outsideClipPlanes = ndcZ < 0.0 || ndcZ > 1.0;
     if (behindCam || outsideFrustum || outsideClipPlanes)
     {
@@ -265,37 +265,7 @@ FragOut frag (v2f i)
             discard;
         alpha = 1;
     }
-    else if (sgu_transparencyMode == 1)
-    {
-        // Halftone ordered dither (4x4 Bayer) for stable stochastic-like transparency.
-        // Use screen-space integer pixel coordinates and a small per-instance offset
-        // to decorrelate neighboring splats. This is deterministic across frames,
-        // reducing temporal flicker compared to random sampling.
-        uint2 p = uint2(i.vertex.xy); // truncate to integer pixel coords
-        uint bx = p.x & 3u;
-        uint by = p.y & 3u;
-
-        // Apply a small per-splat offset to the dither tile to reduce repeating artifacts.
-        uint inst = i.idx;
-        bx = (bx + (inst & 3u)) & 3u;
-        by = (by + ((inst >> 2) & 3u)) & 3u;
-
-        // 4x4 Bayer matrix values 0..15
-        const uint bayer4[16] = {
-            0u, 8u, 2u, 10u,
-            12u,4u,14u,6u,
-            3u,11u,1u,9u,
-            15u,7u,13u,5u
-        };
-        uint t = bayer4[bx + (by << 2)];
-        half cutoff = (t + 0.5) / 16.0;
-
-        // Binary decision: keep pixel if alpha exceeds threshold, otherwise discard.
-        if (alpha <= cutoff)
-            discard;
-        alpha = 1;
-    }
-    else // sgu_transparencyMode == 2 (AlphaBlend)
+    else // sgu_transparencyMode == 1 (AlphaBlend)
     {
         i.col.rgb *= alpha; // premultiply
         // This mode will require proper depth sorting for correct results

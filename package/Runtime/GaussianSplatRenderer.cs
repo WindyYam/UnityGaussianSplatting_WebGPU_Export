@@ -218,7 +218,6 @@ namespace GaussianSplatting.Runtime
                 switch (settings.m_Transparency)
                 {
                     case TransparencyMode.Stochastic:
-                    case TransparencyMode.StochasticHalfTone:
                         // Stochastic transparency with binary alpha
                         displayMat.SetInt(GaussianSplatRenderer.Props.SrcBlend, (int)BlendMode.One);
                         displayMat.SetInt(GaussianSplatRenderer.Props.DstBlend, (int)BlendMode.Zero);
