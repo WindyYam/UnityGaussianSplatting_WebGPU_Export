@@ -2,16 +2,19 @@
 
 **Live WebGPU Demo:** https://windyyam.github.io/unity_splat_test_deploy/
 
-A portability-focused fork aiming for high visual fidelity splat rendering that degrades gracefully on constrained / upcoming WebGPU platforms. Core idea: remove the monolithic global GPU radix sort and replace it with hierarchical culling + small, cache‑friendly per-node CPU sorts parallel on each node to keep ordering cost low.
+This repository is a fork of `aras-p/UnityGaussianSplatting`. Many thanks to @aras-p for the original project and the work that made this fork possible: https://github.com/aras-p/UnityGaussianSplatting
+
+This fork originally followed the `stochastic` branch of the original project and experimented with stochastic sort-free alpha blend. It was heavily modified to build on WebGPU — including removal of the compute shader path — but the stochastic approach introduced noise that degrades the visual quality. As a result, the implementation reverted to CPU-side per-node sorting, augmented with node culling, caching of per-node orderings, and distance-based ordering to mitigate cost and visual artifacts.
+
+As a result, this is a portability-focused fork primarily targeting WebGPU with high visual fidelity splat rendering that works well on constrained / upcoming WebGPU platforms. To maximize compatibility on Web and WASM, the implementation favors CPU-side hierarchical culling and small per-node sorts (which run in parallel when available) rather than relying on large, complex GPU-only global sorts.
 
 ## Highlights
 - Hierarchical octree build (configurable depth & leaf capacity) + outlier bucket.
 - Frustum culling at node granularity drastically reduces sort domain.
 - Per-node (optionally parallel) depth sort using pooled buffers; auto fallback to single-thread (e.g. when WASM threads unavailable).
 - Node centers are pre-ordered by distance to the camera position, and individual splats inside each node are also sorted by distance (not by camera forward). This preserves the sort order when the camera rotates in place, no re-sort needed as opposite to cam forward based sorting.
-- Experimental stochastic / amortized ordering path (design phase) for very dense scenes.
-- WebGPU friendly: no reliance on advanced compute barriers or large global GPU radix passes.
-- Memory conscious: reuses scratch buffers; nodes store indices only.
+- WebGPU-first: CPU-friendly algorithms ensure correctness and portability where advanced GPU features or threading are limited.
+- Memory conscious: reuses scratch buffers; nodes store indices only. Caching of node sort results and ordering by distance further reduces per-frame work.
 
 ## Quick Start
 1. Import / build a Gaussian Splat asset (PLY / SPZ) via the provided editor tooling.
@@ -29,21 +32,14 @@ A portability-focused fork aiming for high visual fidelity splat rendering that 
 | `maxDepth`, `maxSplatsPerLeaf` | Octree granularity | Tune so typical visible leaf has ~32–256 splats |
 | `enableParallelSorting` | Toggle multi-thread path | Leave on for desktop; harmless fallback on Web |
 | `parallelSortThreads` | Requested worker threads | Clamped to hardware & visible leaf count |
-| `useStochasticOrdering` (experimental) | Coarse / amortized ordering | Off by default; densest scenes only |
 
 ## Why Per-Node Sorting Works (Short Version)
-Spatial coherence means most visual correctness comes from good local ordering. Distant clusters rarely interpenetrate; ordering nodes by center + sorting internally captures the bulk of alpha needs while slashing comparisons vs a global O(V log V) pass.
+Spatial coherence means most visual correctness comes from good local ordering. Distant clusters rarely interpenetrate; ordering nodes by center + sorting internally captures the bulk of alpha needs while slashing comparisons vs a global O(V log V) pass. Because we cull at node granularity and cache per-node orderings, the runtime sort workload is light even on constrained devices — suitable for WebGPU and WASM environments.
 
 ## Roadmap / Limitations
-- Stochastic ordering: stabilize heuristics (temporal stability, ghosting checks).
 - No OIT (weighted blended / dual depth peeling) to keep Web path lean.
 - If you only target high-end native, reintroducing a global GPU sort could still win at extreme (> tens of millions) visible splat counts.
-
-## Experimental Non-Sort Concept (In Design)
-Bucket by quantized depth slice per node, shuffle or reuse order across frames, refresh when camera direction changes beyond threshold—amortizing cost for static views.
-
-## Contributing
-PRs welcome for: WebGPU backend improvements, WASM threading validation, stochastic ordering experiments, profiling harnesses.
+- Experimenting with BVH (bounding volume hierarchy) trees as an alternative spatial structure — BVH may better suit very sparse splat distributions by improving culling and reducing per-frame sorting work.
 
 ## License
 See `LICENSE.md`.
