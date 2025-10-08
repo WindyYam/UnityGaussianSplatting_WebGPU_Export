@@ -24,6 +24,7 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_OctreeMaxSplatsPerLeaf;
         SerializedProperty m_OctreeCullingUpdateInterval;
         SerializedProperty m_OctreeSplatRatio;
+        SerializedProperty m_DrawOctreeGizmos;
 
         public void OnEnable()
         {
@@ -41,6 +42,7 @@ namespace GaussianSplatting.Editor
             m_OctreeMaxSplatsPerLeaf = serializedObject.FindProperty("m_OctreeMaxSplatsPerLeaf");
             m_OctreeCullingUpdateInterval = serializedObject.FindProperty("m_OctreeCullingUpdateInterval");
             m_OctreeSplatRatio = serializedObject.FindProperty("m_OctreeSplatRatio");
+            m_DrawOctreeGizmos = serializedObject.FindProperty("m_DrawOctreeGizmos");
         }
 
         public override void OnInspectorGUI()
@@ -69,6 +71,8 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.PropertyField(m_EnableOctreeCulling);
             if (m_EnableOctreeCulling.boolValue)
             {
+                // Toggle whether to draw octree gizmos in the Scene view
+                EditorGUILayout.PropertyField(m_DrawOctreeGizmos, new GUIContent("Draw Octree Gizmos", "Draw octree leaf bounds in the Scene view (OnDrawGizmos)"));
                 EditorGUILayout.PropertyField(m_OctreeMaxDepth);
                 EditorGUILayout.PropertyField(m_OctreeMaxSplatsPerLeaf);
                 EditorGUILayout.PropertyField(m_OctreeCullingUpdateInterval);

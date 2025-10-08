@@ -2,13 +2,13 @@
 
 **Live WebGPU Demo:** https://windyyam.github.io/unity_splat_test_deploy/
 
-A portability-focused fork aiming for high visual fidelity splat rendering that degrades gracefully on constrained / upcoming WebGPU platforms. Core idea: remove the monolithic global GPU radix sort and replace it with hierarchical culling + small, cache‑friendly per-node CPU sorts (optionally parallel) to keep ordering cost low.
+A portability-focused fork aiming for high visual fidelity splat rendering that degrades gracefully on constrained / upcoming WebGPU platforms. Core idea: remove the monolithic global GPU radix sort and replace it with hierarchical culling + small, cache‑friendly per-node CPU sorts parallel on each node to keep ordering cost low.
 
 ## Highlights
 - Hierarchical octree build (configurable depth & leaf capacity) + outlier bucket.
 - Frustum culling at node granularity drastically reduces sort domain.
 - Per-node (optionally parallel) depth sort using pooled buffers; auto fallback to single-thread (e.g. when WASM threads unavailable).
-- Node centers pre-ordered; intra-node ordering yields near visual parity with full global sort for typical scenes.
+- Node centers are pre-ordered by distance to the camera position, and individual splats inside each node are also sorted by distance (not by camera forward). This preserves the sort order when the camera rotates in place, no re-sort needed as opposite to cam forward based sorting.
 - Experimental stochastic / amortized ordering path (design phase) for very dense scenes.
 - WebGPU friendly: no reliance on advanced compute barriers or large global GPU radix passes.
 - Memory conscious: reuses scratch buffers; nodes store indices only.
@@ -19,7 +19,8 @@ A portability-focused fork aiming for high visual fidelity splat rendering that 
 3. Each frame (alpha blend mode):
    - Frustum cull nodes.
    - Gather visible leaves.
-   - (Optional) parallel per-leaf sort.
+   - Sort visible leaves.
+   - Parallel per-leaf sort.
    - Concatenate indices -> single GPU buffer consumed by renderer.
 
 ## Runtime Settings

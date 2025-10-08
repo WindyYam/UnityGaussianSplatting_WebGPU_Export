@@ -703,6 +703,10 @@ namespace GaussianSplatting.Runtime
 
             // Choose color based on debug mode if available
             var settings = GaussianSplatSettings.instance;
+            // If settings explicitly disable drawing octree gizmos, skip drawing
+            if (settings == null || !settings.m_DrawOctreeGizmos)
+                return;
+
             Color col = (settings != null && settings.isDebugRender) ? Color.cyan : Color.yellow;
 
             m_Octree.DrawLeafBoundsGizmos(col);

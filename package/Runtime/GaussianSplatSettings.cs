@@ -83,6 +83,9 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Ratio (0-1) of splats considered as 'screen' splats when building the octree. The remainder are treated as background splats(Always draw first in alpha blend mode).")]
         [Range(0.0f, 1.0f)] public float m_OctreeSplatRatio = 0.9f;
 
+        [Tooltip("Draw octree leaf bounds in the Scene view (OnDrawGizmos)")]
+        public bool m_DrawOctreeGizmos = true;
+
         // Remove the vertex shader mode option since it's now the only mode
         // [Tooltip("Use vertex shader mode for better WebGL compatibility (disables compute shaders and temporal filtering)")]
         // public bool m_UseVertexShaderMode;
