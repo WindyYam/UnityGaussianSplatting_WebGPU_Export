@@ -9,6 +9,7 @@ using UnityEngine;
 // Added for simple threading support
 using System.Threading;
 using System.Buffers;
+using System.Threading.Tasks;
 
 namespace GaussianSplatting.Runtime
 {
@@ -68,7 +69,7 @@ namespace GaussianSplatting.Runtime
             public float distance;
             public int nodeIndex; // Index into m_Nodes instead of copying splat indices
         }
-        
+
         // Reusable list for visible node references during sorting
         readonly List<VisibleNodeRef> m_VisibleNodeRefs = new();        // Enable / disable parallel sorting (public for runtime tuning)
         public bool enableParallelSorting = true;
@@ -88,6 +89,8 @@ namespace GaussianSplatting.Runtime
         bool m_OthersSorted;            // Track if outliers are currently sorted
         Vector3 m_LastOthersSortCamPos; // Camera position at last outlier sort
         float m_OutlierRingRadius;      // Average radial distance of outliers from scene center
+
+        Task[] m_SortTasks;
 
         public int nodeCount => m_Nodes.Count;
         public int totalSplats => m_SplatInfos.Count;
@@ -552,16 +555,32 @@ namespace GaussianSplatting.Runtime
             m_VisibleNodeRefs.Clear();
             var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(camera);
             CollectVisibleNodesWithDistance(0, frustumPlanes, camPosition);
-            
+
             bool doParallel = enableParallelSorting && SystemInfo.processorCount > 1 && m_VisibleNodeRefs.Count >= k_ParallelNodeThreshold;
             if (doParallel)
             {
-                // Launch parallel sorting first, then do other work while threads run
-                var threads = ParallelSortVisibleNodes(camPosition, processOutliersOnMainThread: true);
+                // Non-blocking check: set a flag indicating whether previous sort tasks have finished.
+                // Do not block/wait here — caller can poll this flag if needed.
+                bool previousSortTasksCompleted = true;
+                if (m_SortTasks != null)
+                {
+                    for (int i = 0; i < m_SortTasks.Length; i++)
+                    {
+                        var t = m_SortTasks[i];
+                        if (t != null && !t.IsCompleted)
+                        {
+                            previousSortTasksCompleted = false;
+                            break;
+                        }
+                    }
+                }
+                // Start the new parallel sort workers without blocking.
+                if(previousSortTasksCompleted)
+                    m_SortTasks = ParallelSortVisibleNodes(camPosition);
                 // Sort node references by distance (far-to-near for back-to-front rendering) while parallel work happens
                 m_VisibleNodeRefs.Sort((a, b) => b.distance.CompareTo(a.distance));
-                // Now join the threads after doing useful work on main thread
-                JoinParallelSortThreads(threads);
+                // Now join the tasks after doing useful work on main thread (if desired)
+                // JoinParallelSortThreads(m_SortTasks);
             }
             else
             {
@@ -581,6 +600,7 @@ namespace GaussianSplatting.Runtime
                 }
             }
             // Append nodes in distance order (their lists now internally sorted and persistent)
+            m_VisibleSplatIndices.AddRange(m_OthersIndices);
             for (int i = 0; i < m_VisibleNodeRefs.Count; i++)
             {
                 var nodeRef = m_VisibleNodeRefs[i];
@@ -649,15 +669,17 @@ namespace GaussianSplatting.Runtime
             minOutlierResortDistance = Mathf.Max(0f, minDistance);
         }
 
-        Thread[] ParallelSortVisibleNodes(Vector3 camPosition, bool processOutliersOnMainThread)
+        Task[] ParallelSortVisibleNodes(Vector3 camPosition)
         {
-            int nodeCount = m_VisibleNodeRefs.Count;
-            
-            // Pre-filter nodes that actually need sorting for better thread utilization
-            var nodesToSort = new List<int>(); // Store indices into m_VisibleNodeRefs
+            // Snapshot the visible node refs to avoid concurrent access from parallel tasks
+            var snapshot = m_VisibleNodeRefs.ToArray();
+            int nodeCount = snapshot.Length;
+
+            // Pre-filter nodes that actually need sorting for better task utilization
+            var nodesToSort = new List<int>(); // Store indices into the snapshot array
             for (int i = 0; i < nodeCount; i++)
             {
-                var nodeRef = m_VisibleNodeRefs[i];
+                var nodeRef = snapshot[i];
                 var node = m_Nodes[nodeRef.nodeIndex];
                 if (node.splatIndices != null && node.splatIndices.Count > 1)
                 {
@@ -668,58 +690,128 @@ namespace GaussianSplatting.Runtime
                         Vector3 nodeCenter = node.bounds.center;
                         Vector3 oldDirection = (nodeCenter - node.lastSortCameraPosition).normalized;
                         Vector3 newDirection = (nodeCenter - camPosition).normalized;
-                        
+
                         float cosineAngle = Vector3.Dot(oldDirection, newDirection);
                         needsSort = cosineAngle < sortDirectionThreshold;
                     }
-                    
+
                     if (needsSort)
                         nodesToSort.Add(i);
                 }
             }
-            
+
             int sortNodeCount = nodesToSort.Count;
+            bool haveOutliers = m_OthersIndices.Count > 0;
+            bool needOutlierResort = haveOutliers && ShouldResortOutliers(camPosition);
+
+            // Always run outlier sorting on a background task when needed
+            Task CreateOutlierTaskIfNeeded()
+            {
+                if (!needOutlierResort)
+                    return null;
+
+                return Task.Run(() =>
+                {
+                    try
+                    {
+                        SortSplatsInNodeThreadSafe(m_OthersIndices, camPosition);
+                        m_OthersSorted = true;
+                        m_LastOthersSortCamPos = camPosition;
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogError($"Parallel outlier sorting exception in worker task: {ex}");
+                        try
+                        {
+                            SortSplatsInNode(m_OthersIndices, camPosition);
+                            m_OthersSorted = true;
+                            m_LastOthersSortCamPos = camPosition;
+                        }
+                        catch (Exception fallbackEx)
+                        {
+                            Debug.LogError($"Fallback outlier sequential sorting also failed: {fallbackEx}");
+                        }
+                    }
+                });
+            }
+
             if (sortNodeCount == 0)
             {
-                // No nodes need sorting, just handle outliers
-                if (processOutliersOnMainThread && m_OthersIndices.Count > 0)
-                {
-                    if (ShouldResortOutliers(camPosition))
-                        SortOutliers(camPosition);
-                    m_VisibleSplatIndices.AddRange(m_OthersIndices);
-                }
+                // No nodes need sorting; just spawn outlier task if needed
+                var outlierTask = CreateOutlierTaskIfNeeded();
+                if (outlierTask != null)
+                    return new Task[] { outlierTask };
                 return null;
             }
-            
-            // Clamp desired thread count based on actual work
+
+            // Clamp desired worker count based on actual work
             int hwThreads = Mathf.Max(1, SystemInfo.processorCount - 1); // leave 1 for main
             int workers = Mathf.Clamp(parallelSortThreads, 1, hwThreads);
             workers = Mathf.Min(workers, sortNodeCount); // not more workers than nodes to sort
             if (workers <= 1)
             {
-                // Fallback to sequential - process the filtered nodes
-                if (processOutliersOnMainThread && m_OthersIndices.Count > 0)
+                // Run the filtered node sorting on a background task
+                Task seqTask = null;
+                if (sortNodeCount > 0)
                 {
-                    if (ShouldResortOutliers(camPosition))
-                        SortOutliers(camPosition);
-                    m_VisibleSplatIndices.AddRange(m_OthersIndices);
+                    seqTask = Task.Run(() =>
+                    {
+                        try
+                        {
+                            for (int i = 0; i < sortNodeCount; i++)
+                            {
+                                int nodeRefIndex = nodesToSort[i];
+                                var nodeRef = snapshot[nodeRefIndex];
+                                var node = m_Nodes[nodeRef.nodeIndex];
+                                SortSplatsInNodeThreadSafe(node.splatIndices, camPosition);
+                                node.isSorted = true;
+                                node.lastSortCameraPosition = camPosition;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogError($"Sequential worker task exception: {ex}");
+                            // Fallback: try sequential (non-thread-safe) sort on main thread as last resort
+                            for (int i = 0; i < sortNodeCount; i++)
+                            {
+                                int nodeRefIndex = nodesToSort[i];
+                                var nodeRef = snapshot[nodeRefIndex];
+                                var node = m_Nodes[nodeRef.nodeIndex];
+                                try
+                                {
+                                    SortSplatsInNode(node.splatIndices, camPosition);
+                                    node.isSorted = true;
+                                    node.lastSortCameraPosition = camPosition;
+                                }
+                                catch (Exception fallbackEx)
+                                {
+                                    Debug.LogError($"Fallback sequential sorting also failed: {fallbackEx}");
+                                }
+                            }
+                        }
+                    });
                 }
-                for (int i = 0; i < sortNodeCount; i++)
-                {
-                    int nodeRefIndex = nodesToSort[i];
-                    var nodeRef = m_VisibleNodeRefs[nodeRefIndex];
-                    var node = m_Nodes[nodeRef.nodeIndex];
-                    SortSplatsInNode(node.splatIndices, camPosition);
-                    node.isSorted = true;
-                    node.lastSortCameraPosition = camPosition;
-                }
-                return null; // No threads to join
+
+                // Create outlier task if needed
+                var outlierTask = CreateOutlierTaskIfNeeded();
+
+                // Return tasks array containing the sequential worker and optionally the outlier task
+                if (seqTask != null && outlierTask != null)
+                    return new Task[] { seqTask, outlierTask };
+                if (seqTask != null)
+                    return new Task[] { seqTask };
+                if (outlierTask != null)
+                    return new Task[] { outlierTask };
+                return null; // No tasks to wait on
             }
-            
-            // Distribute nodes that need sorting evenly across threads
+
+            // Determine up-front whether we need a dedicated outlier task so we can size the tasks array correctly
+            bool outlierTaskNeeded = needOutlierResort;
+
+            // Distribute nodes that need sorting evenly across worker slots
             int baseSize = sortNodeCount / workers;
             int remainder = sortNodeCount % workers;
-            Thread[] threads = new Thread[workers];
+            Task[] tasks = new Task[workers + (outlierTaskNeeded ? 1 : 0)];
             int start = 0;
             for (int w = 0; w < workers; w++)
             {
@@ -727,14 +819,19 @@ namespace GaussianSplatting.Runtime
                 int localStart = start;
                 int localEnd = localStart + size; // exclusive
                 start = localEnd;
-                threads[w] = new Thread(() =>
+
+                // Capture localStart/localEnd and snapshot for each task to avoid closure issues
+                int ls = localStart;
+                int le = localEnd;
+                var snap = snapshot;
+                tasks[w] = Task.Run(() =>
                 {
                     try
                     {
-                        for (int i = localStart; i < localEnd; i++)
+                        for (int i = ls; i < le; i++)
                         {
                             int nodeRefIndex = nodesToSort[i];
-                            var nodeRef = m_VisibleNodeRefs[nodeRefIndex];
+                            var nodeRef = snap[nodeRefIndex];
                             var node = m_Nodes[nodeRef.nodeIndex];
                             SortSplatsInNodeThreadSafe(node.splatIndices, camPosition);
                             node.isSorted = true;
@@ -743,12 +840,12 @@ namespace GaussianSplatting.Runtime
                     }
                     catch (Exception ex)
                     {
-                        Debug.LogError($"Parallel splat sorting exception in worker thread: {ex}");
+                        Debug.LogError($"Parallel splat sorting exception in worker task: {ex}");
                         // Re-sort the nodes sequentially as fallback
-                        for (int i = localStart; i < localEnd; i++)
+                        for (int i = ls; i < le; i++)
                         {
                             int nodeRefIndex = nodesToSort[i];
-                            var nodeRef = m_VisibleNodeRefs[nodeRefIndex];
+                            var nodeRef = snap[nodeRefIndex];
                             var node = m_Nodes[nodeRef.nodeIndex];
                             try
                             {
@@ -763,27 +860,28 @@ namespace GaussianSplatting.Runtime
                         }
                     }
                 });
-                threads[w].Start();
             }
-            // While workers run, handle outliers on main thread
-            if (processOutliersOnMainThread && m_OthersIndices.Count > 0)
+
+            // Spawn outlier task if needed and place at the end
+            if (outlierTaskNeeded)
             {
-                if (ShouldResortOutliers(camPosition))
-                    SortOutliers(camPosition);
-                m_VisibleSplatIndices.AddRange(m_OthersIndices);
+                var outlierTask = CreateOutlierTaskIfNeeded();
+                tasks[workers] = outlierTask;
             }
-            
-            // Return threads array for caller to join after doing other work
-            return threads;
+            return tasks;
         }
 
-        void JoinParallelSortThreads(Thread[] threads)
+        void JoinParallelSortThreads(Task[] tasks)
         {
-            if (threads == null) return;
-            
-            // Join workers
-            for (int w = 0; w < threads.Length; w++)
-                threads[w].Join();
+            if (tasks == null) return;
+            try
+            {
+                Task.WaitAll(tasks);
+            }
+            catch (AggregateException ex)
+            {
+                Debug.LogError($"One or more parallel sorting tasks threw exceptions: {ex}");
+            }
         }
 
         /// <summary>
@@ -794,23 +892,23 @@ namespace GaussianSplatting.Runtime
             if (nodeIndex < 0 || nodeIndex >= m_Nodes.Count) return;
             var node = m_Nodes[nodeIndex];
             if (node.splatIndices == null || node.splatIndices.Count <= 1) return;
-            
+
             if (!forceSort && node.isSorted)
             {
                 Vector3 nodeCenter = node.bounds.center;
                 Vector3 oldDirection = (nodeCenter - node.lastSortCameraPosition).normalized;
                 Vector3 newDirection = (nodeCenter - camPosition).normalized;
-                
+
                 float cosineAngle = Vector3.Dot(oldDirection, newDirection);
                 if (cosineAngle >= sortDirectionThreshold)
                     return;
             }
-            
+
             SortSplatsInNode(node.splatIndices, camPosition);
             node.isSorted = true;
             node.lastSortCameraPosition = camPosition;
         }
-        
+
         /// <summary>
         /// Mark all nodes and outliers as needing re-sort.
         /// </summary>
@@ -822,7 +920,7 @@ namespace GaussianSplatting.Runtime
             }
             m_OthersSorted = false;
         }
-        
+
         /// <summary>
         /// Set the sort direction threshold using angle in degrees for easier configuration.
         /// </summary>
