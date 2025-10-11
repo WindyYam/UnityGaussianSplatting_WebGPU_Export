@@ -28,10 +28,10 @@ namespace GaussianSplatting.Runtime
             // Child node indices (indices into m_Nodes). Null or empty for leaf nodes.
             public List<int> childIndices;
             public bool isLeaf;
-            // Track if this node's splats are sorted for current camera view
             public bool isSorted;
-            // Store the camera position used for last sort (to detect when re-sort needed)
             public Vector3 lastSortCameraPosition;
+            // Cached maximum extent (largest half-size axis) for angular sort threshold calculations
+            public float maxExtent;
         }
 
         public struct SplatInfo
@@ -189,7 +189,8 @@ namespace GaussianSplatting.Runtime
                 bounds = m_RootBounds,
                 splatIndices = null,
                 childIndices = null,
-                isLeaf = false
+                isLeaf = false,
+                maxExtent = Mathf.Max(m_RootBounds.extents.x, Mathf.Max(m_RootBounds.extents.y, m_RootBounds.extents.z))
             };
             m_Nodes.Add(rootNode);
 
@@ -324,7 +325,8 @@ namespace GaussianSplatting.Runtime
                     bounds = childBounds[i],
                     splatIndices = null,
                     childIndices = null,
-                    isLeaf = childSplatsIdx[i].Count == 0
+                    isLeaf = childSplatsIdx[i].Count == 0,
+                    maxExtent = Mathf.Max(childBounds[i].extents.x, Mathf.Max(childBounds[i].extents.y, childBounds[i].extents.z))
                 };
 
                 int childNodeIndex = m_Nodes.Count;
@@ -689,8 +691,7 @@ namespace GaussianSplatting.Runtime
                     {
                         Vector3 nodeCenter = node.bounds.center;
                         Vector3 oldDirection = (nodeCenter - node.lastSortCameraPosition).normalized;
-                        Vector3 newDirection = (nodeCenter - camPosition).normalized;
-
+                        Vector3 newDirection = (nodeCenter - oldDirection * node.maxExtent - camPosition).normalized;
                         float cosineAngle = Vector3.Dot(oldDirection, newDirection);
                         needsSort = cosineAngle < sortDirectionThreshold;
                     }
