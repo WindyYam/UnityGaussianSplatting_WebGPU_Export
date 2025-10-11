@@ -29,6 +29,8 @@ As a result, this is a portability-focused fork primarily targeting WebGPU with 
    - Parallel per-leaf sort.
    - Concatenate indices -> single GPU buffer consumed by renderer.
 
+Note: The GaussianExample-URP package includes a ready-to-play scene named "Barangaroo".
+
 ## Runtime Settings
 | Setting | Description | Guidance |
 |---------|-------------|----------|
