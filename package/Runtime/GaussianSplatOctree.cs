@@ -626,7 +626,7 @@ namespace GaussianSplatting.Runtime
                     int originalSplatIdx = splatIndices[i];
                     if (m_OriginalIndexToPosition.TryGetValue(originalSplatIdx, out float3 splatPos))
                     {
-                        float distance = Vector3.Distance((Vector3)splatPos, camPosition);
+                        float distance = ((Vector3)splatPos - camPosition).sqrMagnitude;
                         scratch[i] = (distance, originalSplatIdx);
                     }
                     else
@@ -940,7 +940,7 @@ namespace GaussianSplatting.Runtime
                 int originalSplatIdx = splatIndices[i];
                 if (m_OriginalIndexToPosition.TryGetValue(originalSplatIdx, out float3 splatPos))
                 {
-                    float distance = Vector3.Distance((Vector3)splatPos, camPosition);
+                    float distance = ((Vector3)splatPos - camPosition).sqrMagnitude;
                     m_DistanceSortArray[i] = (distance, originalSplatIdx);
                 }
                 else
@@ -964,7 +964,7 @@ namespace GaussianSplatting.Runtime
             {
                 if (node.splatIndices != null && node.splatIndices.Count > 0)
                 {
-                    float nodeDistance = Vector3.Distance(node.bounds.center, camPosition);
+                    float nodeDistance = (node.bounds.center - camPosition).sqrMagnitude;
                     m_VisibleNodeRefs.Add(new VisibleNodeRef
                     {
                         distance = nodeDistance,
