@@ -28,7 +28,9 @@ namespace GaussianSplatting.Runtime
             // Child node indices (indices into m_Nodes). Null or empty for leaf nodes.
             public List<int> childIndices;
             public bool isLeaf;
+            // Track if this node's splats are sorted for current camera view
             public bool isSorted;
+            // Store the camera position used for last sort (to detect when re-sort needed)
             public Vector3 lastSortCameraPosition;
             // Cached maximum extent (largest half-size axis) for angular sort threshold calculations
             public float maxExtent;

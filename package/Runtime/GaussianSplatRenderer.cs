@@ -21,7 +21,7 @@ namespace GaussianSplatting.Runtime
         internal static readonly ProfilerMarker s_ProfDraw = new(ProfilerCategory.Render, "GaussianSplat.Draw", MarkerFlags.SampleGPU);
         internal static readonly ProfilerMarker s_ProfCompose = new(ProfilerCategory.Render, "GaussianSplat.Compose", MarkerFlags.SampleGPU);
         internal static readonly ProfilerMarker s_ProfCalcView = new(ProfilerCategory.Render, "GaussianSplat.CalcView", MarkerFlags.SampleGPU);
-        internal static readonly ProfilerMarker s_ProfSort = new(ProfilerCategory.Render, "GaussianSplat.Sort", MarkerFlags.SampleGPU);
+
         // ReSharper restore MemberCanBePrivate.Global
 
         public static GaussianSplatRenderSystem instance => ms_Instance ??= new GaussianSplatRenderSystem();
@@ -41,6 +41,14 @@ namespace GaussianSplatting.Runtime
         Material m_MatDebugBoxes;
         uint m_FrameOffset;
         GaussianSplatTemporalFilter m_TemporalFilter;
+
+        // Persistent render targets to avoid per-frame allocations
+        RenderTexture m_PersistentColorRT;
+        RenderTexture m_PersistentMotionRT;
+        int m_PersistentRTWidth;
+        int m_PersistentRTHeight;
+        GraphicsFormat m_PersistentColorFormat;
+        GraphicsFormat m_PersistentMotionFormat;
 
         // Public accessor to get or create the temporal filter instance.
         // Other renderer features (URP/HDRP) should call this to obtain the filter
@@ -118,9 +126,64 @@ namespace GaussianSplatting.Runtime
             Object.DestroyImmediate(m_MatDebugBoxes);
             m_TemporalFilter?.Dispose();
             m_TemporalFilter = null;
+
+            // Destroy persistent render textures
+            if (m_PersistentColorRT)
+            {
+                m_PersistentColorRT.Release();
+                Object.DestroyImmediate(m_PersistentColorRT);
+                m_PersistentColorRT = null;
+            }
+            if (m_PersistentMotionRT)
+            {
+                m_PersistentMotionRT.Release();
+                Object.DestroyImmediate(m_PersistentMotionRT);
+                m_PersistentMotionRT = null;
+            }
+
             // Cleanup static dummy buffers when no more splats exist
             GaussianSplatRenderer.DisposeDummyBuffers();
             Camera.onPreCull -= OnPreCullCamera;
+        }
+
+        // Ensure persistent render textures exist and match requested size/format
+        void EnsurePersistentRenderTextures(int width, int height, GraphicsFormat colorGfxFormat, GraphicsFormat motionGfxFormat)
+        {
+            bool needRecreate = m_PersistentColorRT == null || m_PersistentMotionRT == null ||
+                                m_PersistentRTWidth != width || m_PersistentRTHeight != height ||
+                                m_PersistentColorFormat != colorGfxFormat || m_PersistentMotionFormat != motionGfxFormat;
+
+            if (!needRecreate)
+                return;
+
+            // Destroy old
+            if (m_PersistentColorRT)
+            {
+                m_PersistentColorRT.Release();
+                Object.DestroyImmediate(m_PersistentColorRT);
+                m_PersistentColorRT = null;
+            }
+            if (m_PersistentMotionRT)
+            {
+                m_PersistentMotionRT.Release();
+                Object.DestroyImmediate(m_PersistentMotionRT);
+                m_PersistentMotionRT = null;
+            }
+
+            // Create new color RT
+            var colorDesc = new RenderTextureDescriptor(width, height, colorGfxFormat, 0) { msaaSamples = 1, useMipMap = false, autoGenerateMips = false };
+            m_PersistentColorRT = new RenderTexture(colorDesc) { name = "GaussianSplatColorRT" };
+            m_PersistentColorRT.Create();
+
+            // Create motion RT - use 4 channel float for compatibility
+            var motionDesc = new RenderTextureDescriptor(width, height, motionGfxFormat, 0) { msaaSamples = 1, useMipMap = false, autoGenerateMips = false };
+            m_PersistentMotionRT = new RenderTexture(motionDesc) { name = "GaussianSplatMotionRT" };
+            m_PersistentMotionRT.Create();
+
+            m_PersistentRTWidth = width;
+            m_PersistentRTHeight = height;
+            m_PersistentColorFormat = colorGfxFormat;
+            m_PersistentMotionFormat = motionGfxFormat;
         }
 
         // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
@@ -159,28 +222,6 @@ namespace GaussianSplatting.Runtime
         }
 
         // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
-        public void SortAllSplats(Camera cam, CommandBuffer cmb)
-        {
-            if (cam.cameraType == CameraType.Preview)
-                return;
-            GaussianSplatSettings settings = GaussianSplatSettings.instance;
-            if (!settings.needSorting)
-                return; // no need to sort
-
-            foreach (var kvp in m_ActiveSplats)
-            {
-                var gs = kvp.Item1;
-                var matrix = gs.transform.localToWorldMatrix;
-                
-                // Increment frame counter for all modes
-                ++gs.m_FrameCounter;
-                
-                // Note: For alpha blend mode with octree culling, sorting is now done 
-                // in PerformOctreeCulling() as part of the hierarchical optimization
-            }
-        }
-
-        // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
         public void RenderAllSplats(Camera cam, CommandBuffer cmb)
         {
             EnsureMaterials();
@@ -203,6 +244,24 @@ namespace GaussianSplatting.Runtime
             sgu[0] = new SplatGlobalUniforms { transparencyMode = (uint)settings.m_Transparency, frameOffset = m_FrameOffset, needMotionVectors = (uint)settings.m_TemporalFilter};
             cmb.SetBufferData(m_GlobalUniforms, sgu);
             m_FrameOffset++;
+
+            // Bind global constant buffer once per frame instead of per-splat
+            cmb.SetGlobalConstantBuffer(m_GlobalUniforms, GaussianSplatRenderer.Props.SplatGlobalUniforms, 0, m_GlobalUniforms.stride);
+            
+            // Set global shader properties that are identical for all splats this frame
+            // Screen params and camera position are the same for all instances - set them once
+            int screenW = cam.pixelWidth, screenH = cam.pixelHeight;
+            int eyeW = XRSettings.eyeTextureWidth, eyeH = XRSettings.eyeTextureHeight;
+            Vector4 screenPar = new Vector4(eyeW != 0 ? eyeW : screenW, eyeH != 0 ? eyeH : screenH, 0, 0);
+            Vector4 camPos = cam.transform.position;
+            cmb.SetGlobalVector(GaussianSplatRenderer.Props.VecScreenParams, screenPar);
+            cmb.SetGlobalVector(GaussianSplatRenderer.Props.VecWorldSpaceCameraPos, camPos);
+
+            // Set material/global flags that are identical across all splats
+            displayMat.SetFloat(GaussianSplatRenderer.Props.SplatSize, settings.m_PointDisplaySize);
+            displayMat.SetInteger(GaussianSplatRenderer.Props.SHOnly, settings.m_SHOnly ? 1 : 0);
+            displayMat.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, settings.m_RenderMode == DebugRenderMode.DebugPointIndices ? 1 : 0);
+            displayMat.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, settings.m_RenderMode == DebugRenderMode.DebugChunkBounds ? 1 : 0);
 
             // Set blend mode based on transparency mode
             if (settings.isDebugRender)
@@ -236,7 +295,7 @@ namespace GaussianSplatting.Runtime
             foreach (var kvp in m_ActiveSplats)
             {
                 var gs = kvp.Item1;
-
+                ++gs.m_FrameCounter;
                 var matrix = gs.transform.localToWorldMatrix;
 
                 var mpb = kvp.Item2;
@@ -247,11 +306,6 @@ namespace GaussianSplatting.Runtime
                 Matrix4x4 matO2W = matrix;
                 Matrix4x4 matW2O = matrix.inverse;
                 Matrix4x4 currentMatMV = matView * matO2W;
-                int screenW = cam.pixelWidth, screenH = cam.pixelHeight;
-                int eyeW = XRSettings.eyeTextureWidth, eyeH = XRSettings.eyeTextureHeight;
-                Vector4 screenPar = new Vector4(eyeW != 0 ? eyeW : screenW, eyeH != 0 ? eyeH : screenH, 0, 0);
-                Vector4 camPos = cam.transform.position;
-                
                 mpb.SetMatrix(GaussianSplatRenderer.Props.MatrixMV, currentMatMV);
                 mpb.SetMatrix(GaussianSplatRenderer.Props.PrevMatrixMV, gs.m_PrevMatrixMV);
                 // Compute approximate previous view matrix. Splat objects are static,
@@ -260,17 +314,16 @@ namespace GaussianSplatting.Runtime
                 mpb.SetMatrix(GaussianSplatRenderer.Props.PrevMatrixV, prevView);
                 mpb.SetMatrix(GaussianSplatRenderer.Props.MatrixObjectToWorld, matO2W);
                 mpb.SetMatrix(GaussianSplatRenderer.Props.MatrixWorldToObject, matW2O);
-                mpb.SetVector(GaussianSplatRenderer.Props.VecScreenParams, screenPar);
-                mpb.SetVector(GaussianSplatRenderer.Props.VecWorldSpaceCameraPos, camPos);
 
+                // Per-instance properties
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatScale, gs.m_SplatScale);
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatOpacityScale, gs.m_OpacityScale);
-                mpb.SetFloat(GaussianSplatRenderer.Props.SplatSize, settings.m_PointDisplaySize);
                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOrder, gs.m_SHOrder);
                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOnly, settings.m_SHOnly ? 1 : 0);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, settings.m_RenderMode == DebugRenderMode.DebugPointIndices ? 1 : 0);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, settings.m_RenderMode == DebugRenderMode.DebugChunkBounds ? 1 : 0);
-                mpb.SetConstantBuffer(GaussianSplatRenderer.Props.SplatGlobalUniforms, m_GlobalUniforms, 0, m_GlobalUniforms.stride);
+                // Global constant buffer is bound once per frame via CommandBuffer.SetGlobalConstantBuffer
+                // Avoid per-instance SetConstantBuffer to prevent property type conflicts in the material property sheet.
 
                 int indexCount = 6;
                 int instanceCount = gs.splatCount;
@@ -386,43 +439,44 @@ namespace GaussianSplatting.Runtime
                 // Motion needs a linear floating format (no sRGB) - use RGBA format for WebGPU compatibility
                 GraphicsFormat motionGfxFormat = GraphicsFormat.R16G16B16A16_SFloat;
 
-                var descColor = new RenderTextureDescriptor(rtW, rtH, colorGfxFormat, 0) { msaaSamples = 1, useMipMap = false, autoGenerateMips = false };
-                var descMotion = new RenderTextureDescriptor(rtW, rtH, motionGfxFormat, 0) { msaaSamples = 1, useMipMap = false, autoGenerateMips = false };
+                // Ensure persistent RTs exist and match requested size/format to avoid per-frame allocation
+                EnsurePersistentRenderTextures(rtW, rtH, colorGfxFormat, motionGfxFormat);
 
-                m_CommandBuffer.GetTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatRT, descColor, FilterMode.Point);
-                m_CommandBuffer.GetTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatMotionRT, descMotion, FilterMode.Point);
-                m_CommandBuffer.SetRenderTarget(new RenderTargetIdentifier[] { GaussianSplatRenderer.Props.GaussianSplatRT, GaussianSplatRenderer.Props.GaussianSplatMotionRT }, BuiltinRenderTextureType.CurrentActive);
+                // Bind persistent RTs into the command buffer and set as active targets
+                var rtIds = new RenderTargetIdentifier[] { new RenderTargetIdentifier(m_PersistentColorRT), new RenderTargetIdentifier(m_PersistentMotionRT) };
+                m_CommandBuffer.SetRenderTarget(rtIds, BuiltinRenderTextureType.CurrentActive);
                 m_CommandBuffer.ClearRenderTarget(RTClearFlags.Color, new Color(0, 0, 0, 0), 0, 0);
-            }
 
-            // add sorting, view calc and drawing commands for all splat objects
-            SortAllSplats(cam, m_CommandBuffer);
-            // View data calculation is now done in vertex shader
-            RenderAllSplats(cam, m_CommandBuffer);
+                // Also set global texture bindings so subsequent passes/shaders can sample them by name
+                m_CommandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.GaussianSplatRT, m_PersistentColorRT);
+                m_CommandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.GaussianSplatMotionRT, m_PersistentMotionRT);
+             }
 
-            // compose - with temporal filtering if enabled
-            if (!settings.isDebugRender)
-            {
-                m_CommandBuffer.BeginSample(s_ProfCompose);
-                if (settings.m_TemporalFilter != TemporalFilter.None)
-                {
-                    m_TemporalFilter ??= new GaussianSplatTemporalFilter();
-                    m_TemporalFilter.Render(m_CommandBuffer, cam, matComposite, 1,
-                        GaussianSplatRenderer.Props.GaussianSplatRT, BuiltinRenderTextureType.CameraTarget,
-                        cam.pixelWidth, cam.pixelHeight,
-                        settings.m_FrameInfluence, settings.m_VarianceClampScale,
-                        GaussianSplatRenderer.Props.GaussianSplatMotionRT);
-                }
-                else
-                {
-                    m_CommandBuffer.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
-                    m_CommandBuffer.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 3, 1);
-                }
-                m_CommandBuffer.EndSample(s_ProfCompose);
-                m_CommandBuffer.ReleaseTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatRT);
-                m_CommandBuffer.ReleaseTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatMotionRT);
-            }
-        }
+             // View data calculation is now done in vertex shader
+             RenderAllSplats(cam, m_CommandBuffer);
+
+             // compose - with temporal filtering if enabled
+             if (!settings.isDebugRender)
+             {
+                 m_CommandBuffer.BeginSample(s_ProfCompose);
+                 if (settings.m_TemporalFilter != TemporalFilter.None)
+                 {
+                     m_TemporalFilter ??= new GaussianSplatTemporalFilter();
+                     m_TemporalFilter.Render(m_CommandBuffer, cam, matComposite, 1,
+                         GaussianSplatRenderer.Props.GaussianSplatRT, BuiltinRenderTextureType.CameraTarget,
+                         cam.pixelWidth, cam.pixelHeight,
+                         settings.m_FrameInfluence, settings.m_VarianceClampScale,
+                         GaussianSplatRenderer.Props.GaussianSplatMotionRT);
+                 }
+                 else
+                 {
+                     m_CommandBuffer.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                     m_CommandBuffer.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 3, 1);
+                 }
+                 m_CommandBuffer.EndSample(s_ProfCompose);
+                 // Persistent RTs are reused; they will be destroyed when all splats are cleaned up
+             }
+         }
     }
 
     [ExecuteInEditMode]
@@ -754,11 +808,8 @@ namespace GaussianSplatting.Runtime
             // For alpha blend mode, use hierarchical sorting which does culling + sorting in one pass
             if (settings.m_Transparency == TransparencyMode.AlphaBlend)
             {
-                using (GaussianSplatRenderSystem.s_ProfSort.Auto())
-                {
-                    m_Octree.SortVisibleSplatsByDepth(camera);
-                    return m_Octree.visibleSplatCount;
-                }
+                m_Octree.SortVisibleSplatsByDepth(camera);
+                return m_Octree.visibleSplatCount;
             }
             else
             {

@@ -3,8 +3,8 @@ Shader "Gaussian Splatting/Render Splats"
 {
 	Properties
 	{
-		_SrcBlend("Src Blend", Float) = 8 // OneMinusDstAlpha
-		_DstBlend("Dst Blend", Float) = 1 // One
+		_SrcBlend("Src Blend", Float) = 1 // One
+		_DstBlend("Dst Blend", Float) = 8 // OneMinusDstAlpha
 		_ZWrite("ZWrite", Float) = 0  // Off
 	}
     SubShader
