@@ -761,7 +761,8 @@ namespace GaussianSplatting.Runtime
                     {
                         try
                         {
-                            for (int i = 0; i < sortNodeCount; i++)
+                            // Process from back to front for visual priority (closer nodes processed first)
+                            for (int i = sortNodeCount - 1; i >= 0; i--)
                             {
                                 int nodeRefIndex = nodesToSort[i];
                                 var nodeRef = snapshot[nodeRefIndex];
@@ -775,7 +776,7 @@ namespace GaussianSplatting.Runtime
                         {
                             Debug.LogError($"Sequential worker task exception: {ex}");
                             // Fallback: try sequential (non-thread-safe) sort on main thread as last resort
-                            for (int i = 0; i < sortNodeCount; i++)
+                            for (int i = sortNodeCount - 1; i >= 0; i--)
                             {
                                 int nodeRefIndex = nodesToSort[i];
                                 var nodeRef = snapshot[nodeRefIndex];
@@ -809,17 +810,17 @@ namespace GaussianSplatting.Runtime
             }
 
             // Work-stealing parallel sort implementation
-            // Shared work queue with thread-safe access
-            int nextWorkIndex = 0;
+            // Shared work queue with thread-safe access - process from back to front for visual priority
+            int nextWorkIndex = sortNodeCount - 1; // Start from the end (closest nodes)
             object workLock = new object();
 
-            // Get next work item (thread-safe)
+            // Get next work item (thread-safe) - process from back to front for visual priority
             int GetNextWorkIndex()
             {
                 lock (workLock)
                 {
-                    if (nextWorkIndex < sortNodeCount)
-                        return nextWorkIndex++;
+                    if (nextWorkIndex >= 0)
+                        return nextWorkIndex--;
                     return -1; // No more work
                 }
             }
