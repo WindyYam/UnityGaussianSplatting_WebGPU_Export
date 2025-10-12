@@ -808,33 +808,39 @@ namespace GaussianSplatting.Runtime
                 return null; // No tasks to wait on
             }
 
+            // Work-stealing parallel sort implementation
+            // Shared work queue with thread-safe access
+            int nextWorkIndex = 0;
+            object workLock = new object();
+
+            // Get next work item (thread-safe)
+            int GetNextWorkIndex()
+            {
+                lock (workLock)
+                {
+                    if (nextWorkIndex < sortNodeCount)
+                        return nextWorkIndex++;
+                    return -1; // No more work
+                }
+            }
+
             // Determine up-front whether we need a dedicated outlier task so we can size the tasks array correctly
             bool outlierTaskNeeded = needOutlierResort;
 
-            // Distribute nodes that need sorting evenly across worker slots
-            int baseSize = sortNodeCount / workers;
-            int remainder = sortNodeCount % workers;
+            // Create worker tasks that pull work as needed
             Task[] tasks = new Task[workers + (outlierTaskNeeded ? 1 : 0)];
-            int start = 0;
+            
             for (int w = 0; w < workers; w++)
             {
-                int size = baseSize + (w < remainder ? 1 : 0);
-                int localStart = start;
-                int localEnd = localStart + size; // exclusive
-                start = localEnd;
-
-                // Capture localStart/localEnd and snapshot for each task to avoid closure issues
-                int ls = localStart;
-                int le = localEnd;
-                var snap = snapshot;
                 tasks[w] = Task.Run(() =>
                 {
                     try
                     {
-                        for (int i = ls; i < le; i++)
+                        int workIndex;
+                        while ((workIndex = GetNextWorkIndex()) != -1)
                         {
-                            int nodeRefIndex = nodesToSort[i];
-                            var nodeRef = snap[nodeRefIndex];
+                            int nodeRefIndex = nodesToSort[workIndex];
+                            var nodeRef = snapshot[nodeRefIndex];
                             var node = m_Nodes[nodeRef.nodeIndex];
                             SortSplatsInNodeThreadSafe(node.splatIndices, camPosition);
                             node.isSorted = true;
@@ -844,11 +850,12 @@ namespace GaussianSplatting.Runtime
                     catch (Exception ex)
                     {
                         Debug.LogError($"Parallel splat sorting exception in worker task: {ex}");
-                        // Re-sort the nodes sequentially as fallback
-                        for (int i = ls; i < le; i++)
+                        // Continue processing remaining work items with fallback method
+                        int workIndex;
+                        while ((workIndex = GetNextWorkIndex()) != -1)
                         {
-                            int nodeRefIndex = nodesToSort[i];
-                            var nodeRef = snap[nodeRefIndex];
+                            int nodeRefIndex = nodesToSort[workIndex];
+                            var nodeRef = snapshot[nodeRefIndex];
                             var node = m_Nodes[nodeRef.nodeIndex];
                             try
                             {
