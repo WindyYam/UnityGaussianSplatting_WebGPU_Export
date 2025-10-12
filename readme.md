@@ -30,6 +30,8 @@ As a result, this is a portability-focused fork primarily targeting WebGPU with 
 
 Note: The GaussianExample-URP package includes a ready-to-play scene named "Barangaroo".
 
+Note: The GaussianExample-URP package includes a ready-to-play scene named "Barangaroo".
+
 ## Runtime Settings
 | Setting | Description | Guidance |
 |---------|-------------|----------|
