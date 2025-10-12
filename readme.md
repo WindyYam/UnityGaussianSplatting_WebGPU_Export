@@ -21,13 +21,14 @@ As a result, this is a portability-focused fork primarily targeting WebGPU with 
 2. Octree builds once (respect `maxDepth`, `maxSplatsPerLeaf`). Outliers separated automatically during preprocessing: very far-away sparse splats (e.g. sky pixels, distant noise, or background samples produced by MCMC strategies) are detected and placed into an outlier bucket and treated as background. This lets the octree build focus on the main dense splat region — improving node efficiency and reducing per-node sort cost. The aggressiveness of the outlier filter can be tuned via the "scene splat ratio" setting to control how many splats are included in the main octree build versus moved to the outlier bucket.
 
    Tip: You can visualize the octree node bounds and leaf centers in the Unity Scene view by enabling the "Draw Gizmos" checkbox in the Gaussian Splat settings script. This overlay is useful for diagnosing outliers and tuning `maxDepth`, `maxSplatsPerLeaf`, and the scene splat ratio.
-
-3. Each frame (alpha blend mode):
+   3. Each frame (alpha blend mode):
    - Frustum cull nodes.
    - Gather visible leaves.
-   - Sort visible leaves.
-   - Parallel per-leaf sort.
-   - Concatenate indices -> single GPU buffer consumed by renderer.
+   - Sort visible leaves (by node center distance, not precise, but until we find better solution).
+   - Kick off parallel per-leaf sorts in the background (non‑blocking). Per-leaf sorting runs asynchronously and updates per-node cached orderings when complete.
+   - Concatenate currently available per-node indices by leaves sort order into a single GPU buffer consumed by the renderer; updated orderings are picked up on subsequent frames once background sorts finish.
+
+Note: The GaussianExample-URP package includes a ready-to-play scene named "Barangaroo".
 
 ## Runtime Settings
 | Setting | Description | Guidance |
@@ -37,15 +38,11 @@ As a result, this is a portability-focused fork primarily targeting WebGPU with 
 | `parallelSortThreads` | Requested worker threads | Clamped to hardware & visible leaf count |
 
 Recommended defaults and guidance:
-- Keep node sizes reasonable so per-leaf sorts stay cheap. A good starting point for many scenes is `maxDepth = 8` and `maxSplatsPerLeaf = 4096`.
+- Keep node sizes reasonable so per-leaf sorts stay cheap. A good starting point for many scenes is `maxDepth = 8` and `maxSplatsPerLeaf = 1024`.
 - For the outlier filter (scene splat ratio), try `0.90`–`0.95` to push very sparse, far-away splats into the outlier bucket; if your scene is very clean (no distant noise) you can set this to `1.0`.
 
-## Why Per-Node Sorting Works (Short Version)
-Spatial coherence means most visual correctness comes from good local ordering. Distant clusters rarely interpenetrate; ordering nodes by center + sorting internally captures the bulk of alpha needs while slashing comparisons vs a global O(V log V) pass. Because we cull at node granularity and cache per-node orderings, the runtime sort workload is light even on constrained devices — suitable for WebGPU and WASM environments.
-
 ## Roadmap / Limitations
-- No OIT (weighted blended / dual depth peeling) to keep Web path lean.
-- If you only target high-end native, reintroducing a global GPU sort could still win at extreme (> tens of millions) visible splat counts.
+- If you only target high-end native, reintroducing a global GPU radix sort could still win at extreme (> tens of millions) visible splat counts.
 - Experimenting with BVH (bounding volume hierarchy) trees as an alternative spatial structure — BVH may better suit very sparse splat distributions by improving culling and reducing per-frame sorting work.
 - The visible-node sort used at runtime is an approximation for splat ordering and may need a more robust artifact-free solution.
 
