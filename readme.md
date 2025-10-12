@@ -11,10 +11,9 @@ As a result, this is a portability-focused fork primarily targeting WebGPU with 
 ## Highlights
 - Hierarchical octree build (configurable depth & leaf capacity) + outlier bucket.
 - Frustum culling at node granularity drastically reduces sort domain.
-- Per-node (optionally parallel) depth sort using pooled buffers; auto fallback to single-thread (e.g. when WASM threads unavailable).
+- Per-node sorts run asynchronously in the background (non‑blocking), updating cached orderings when complete so rendering is not blocked by sorting.
 - Node centers are pre-ordered by distance to the camera position, and individual splats inside each node are also sorted by distance (not by camera forward). This preserves the sort order when the camera rotates in place, no re-sort needed as opposite to cam forward based sorting.
 - WebGPU-first: CPU-friendly algorithms ensure correctness and portability where advanced GPU features or threading are limited.
-- Memory conscious: reuses scratch buffers; nodes store indices only. Caching of node sort results and ordering by distance further reduces per-frame work.
 
 ## Quick Start
 1. Import / build a Gaussian Splat asset (PLY / SPZ) via the provided editor tooling.
@@ -30,14 +29,12 @@ As a result, this is a portability-focused fork primarily targeting WebGPU with 
 
 Note: The GaussianExample-URP package includes a ready-to-play scene named "Barangaroo".
 
-Note: The GaussianExample-URP package includes a ready-to-play scene named "Barangaroo".
-
 ## Runtime Settings
 | Setting | Description | Guidance |
 |---------|-------------|----------|
-| `maxDepth`, `maxSplatsPerLeaf` | Octree granularity | Tune so typical visible leaf has ~32–256 splats |
-| `enableParallelSorting` | Toggle multi-thread path | Leave on for desktop; harmless fallback on Web |
-| `parallelSortThreads` | Requested worker threads | Clamped to hardware & visible leaf count |
+| `maxDepth`, `maxSplatsPerLeaf` | Octree granularity | Tune so typical visible leaf has ~1024 splats |
+| `enableParallelSorting` | Toggle multi-thread path | Always leave on for obvious reason |
+| `parallelSortThreads` | Requested worker threads | Default 256 (just in case you have 256 cores) and will clamped to hardware & visible leaf count |
 
 Recommended defaults and guidance:
 - Keep node sizes reasonable so per-leaf sorts stay cheap. A good starting point for many scenes is `maxDepth = 8` and `maxSplatsPerLeaf = 1024`.
