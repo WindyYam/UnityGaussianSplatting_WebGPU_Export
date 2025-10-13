@@ -247,7 +247,7 @@ namespace GaussianSplatting.Runtime
                 init.Dispose();
             }
 
-            Debug.Log($"Octree build completed with tight bounds: {m_Nodes.Count} total nodes, others={m_OthersIndices.Count}");
+            Debug.Log($"Octree build completed: {m_Nodes.Count} total nodes, others={m_OthersIndices.Count}");
         }
 
         void BuildRecursive(int nodeIndex, int depth, List<int> splatList)
@@ -271,13 +271,6 @@ namespace GaussianSplatting.Runtime
                     node.splatIndices.Add(m_SplatInfos[infoIdx].originalIndex);
                 }
 
-                // Compress bounds tightly around the actual splats in this leaf
-                if (splatList.Count > 0)
-                {
-                    node.bounds = ComputeTightBounds(splatList);
-                    node.maxExtent = Mathf.Max(node.bounds.extents.x, Mathf.Max(node.bounds.extents.y, node.bounds.extents.z));
-                }
-
                 m_Nodes[nodeIndex] = node;
                 return;
             }
@@ -290,11 +283,24 @@ namespace GaussianSplatting.Runtime
             node.isLeaf = false;
             m_Nodes[nodeIndex] = node;
 
-            // Distribute splats to children first
+            // Compute child centers (keep parent center positioning) but defer computing tight bounds
+            var childCenters = new Vector3[8];
+            var defaultChildSize = size; // fallback size for empty children
+            for (int i = 0; i < 8; i++)
+            {
+                var offset = new Vector3(
+                    (i & 1) != 0 ? size.x * 0.5f : -size.x * 0.5f,
+                    (i & 2) != 0 ? size.y * 0.5f : -size.y * 0.5f,
+                    (i & 4) != 0 ? size.z * 0.5f : -size.z * 0.5f
+                );
+                childCenters[i] = center + offset;
+            }
+
+            // Distribute splats to children
             var childSplatsIdx = new List<int>[8];
             for (int i = 0; i < 8; i++) childSplatsIdx[i] = new List<int>();
 
-            // Assign splats (using splatList which holds indices into m_SplatInfos) to child octants
+            // Assign splats (using splatList which holds indices into m_SplatInfos) to child nodes
             for (int ii = 0; ii < splatList.Count; ii++)
             {
                 int infoIdx = splatList[ii];
@@ -314,22 +320,52 @@ namespace GaussianSplatting.Runtime
                 childSplatsIdx[childIndex].Add(infoIdx);
             }
 
-            // Create child nodes only for octants that have splats, with tight bounds
+            // Create child nodes. For children that contain splats, compute a tight bound
+            // around their assigned splats while keeping the computed child center.
             for (int i = 0; i < 8; i++)
             {
-                if (childSplatsIdx[i].Count == 0)
-                    continue; // Skip empty octants
+                Bounds b;
+                var centerOfChild = childCenters[i];
+                if (childSplatsIdx[i].Count > 0)
+                {
+                    // Compute tight min/max of splat positions for this child
+                    Vector3 min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+                    Vector3 max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+                    for (int si = 0; si < childSplatsIdx[i].Count; si++)
+                    {
+                        int infoIdx = childSplatsIdx[i][si];
+                        var p = (Vector3)m_SplatInfos[infoIdx].position;
+                        min = Vector3.Min(min, p);
+                        max = Vector3.Max(max, p);
+                    }
 
-                // Compute tight bounding box for this child's splats, constrained by parent bounds
-                Bounds tightBounds = ComputeTightBounds(childSplatsIdx[i], node.bounds);
+                    // Compute half-extent required to cover splats while keeping the child center fixed.
+                    float halfX = Mathf.Max(Mathf.Abs(max.x - centerOfChild.x), Mathf.Abs(centerOfChild.x - min.x));
+                    float halfY = Mathf.Max(Mathf.Abs(max.y - centerOfChild.y), Mathf.Abs(centerOfChild.y - min.y));
+                    float halfZ = Mathf.Max(Mathf.Abs(max.z - centerOfChild.z), Mathf.Abs(centerOfChild.z - min.z));
+
+                    // Ensure a small non-zero size to avoid degenerate bounds
+                    const float kMinExtent = 1e-4f;
+                    halfX = Mathf.Max(halfX, kMinExtent);
+                    halfY = Mathf.Max(halfY, kMinExtent);
+                    halfZ = Mathf.Max(halfZ, kMinExtent);
+
+                    var finalSize = new Vector3(halfX * 2f, halfY * 2f, halfZ * 2f);
+                    b = new Bounds(centerOfChild, finalSize);
+                }
+                else
+                {
+                    // Empty child - use default half-size box centered at computed child center
+                    b = new Bounds(centerOfChild, defaultChildSize);
+                }
 
                 var childNode = new OctreeNode
                 {
-                    bounds = tightBounds,
+                    bounds = b,
                     splatIndices = null,
                     childIndices = null,
-                    isLeaf = false,
-                    maxExtent = Mathf.Max(tightBounds.extents.x, Mathf.Max(tightBounds.extents.y, tightBounds.extents.z))
+                    isLeaf = childSplatsIdx[i].Count == 0,
+                    maxExtent = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z))
                 };
 
                 int childNodeIndex = m_Nodes.Count;
@@ -340,71 +376,12 @@ namespace GaussianSplatting.Runtime
                 // Update parent reference in the global list (node is a reference type)
                 m_Nodes[nodeIndex] = node;
 
-                // Recursively build child
-                BuildRecursive(childNodeIndex, depth + 1, childSplatsIdx[i]);
-            }
-        }
-
-        /// <summary>
-        /// Compute tight bounding box from a list of splat indices.
-        /// Optionally clamps the result to stay within parent bounds for proper hierarchy.
-        /// </summary>
-        Bounds ComputeTightBounds(List<int> splatIndices, Bounds? parentBounds = null)
-        {
-            if (splatIndices.Count == 0)
-            {
-                Debug.LogWarning("ComputeTightBounds called with empty splat list");
-                return new Bounds();
-            }
-
-            // Start with first splat position
-            int firstInfoIdx = splatIndices[0];
-            if (firstInfoIdx < 0 || firstInfoIdx >= m_SplatInfos.Count)
-            {
-                Debug.LogError($"ComputeTightBounds: splat info index out of bounds: {firstInfoIdx} >= {m_SplatInfos.Count}");
-                return new Bounds();
-            }
-
-            float3 min = m_SplatInfos[firstInfoIdx].position;
-            float3 max = min;
-
-            // Expand bounds to include all splats
-            for (int i = 1; i < splatIndices.Count; i++)
-            {
-                int infoIdx = splatIndices[i];
-                if (infoIdx < 0 || infoIdx >= m_SplatInfos.Count)
+                // Recursively build child only if it has splats
+                if (childSplatsIdx[i].Count > 0)
                 {
-                    Debug.LogError($"ComputeTightBounds: splat info index out of bounds: {infoIdx} >= {m_SplatInfos.Count}");
-                    continue;
+                    BuildRecursive(childNodeIndex, depth + 1, childSplatsIdx[i]);
                 }
-
-                float3 pos = m_SplatInfos[infoIdx].position;
-                min = math.min(min, pos);
-                max = math.max(max, pos);
             }
-
-            // Clamp to parent bounds if specified to maintain hierarchy
-            if (parentBounds.HasValue)
-            {
-                var pBounds = parentBounds.Value;
-                Vector3 pMin = (Vector3)pBounds.min;
-                Vector3 pMax = (Vector3)pBounds.max;
-                
-                min = math.max(min, pMin);
-                max = math.min(max, pMax);
-            }
-
-            // Create bounds from min/max
-            Vector3 center = (max + min) * 0.5f;
-            Vector3 size = max - min;
-            
-            // Ensure minimum size to avoid degenerate bounds for single splats or colinear points
-            const float minSize = 1e-6f;
-            if (size.x < minSize) size.x = minSize;
-            if (size.y < minSize) size.y = minSize;
-            if (size.z < minSize) size.z = minSize;
-
-            return new Bounds(center, size);
         }
 
         /// <summary>
