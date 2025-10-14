@@ -233,8 +233,14 @@ struct FragOut { half4 col : SV_Target0; half4 motion : SV_Target1; };
 FragOut frag (v2f i)
 {
     FragOut o; o.col = 0; o.motion = half4(0, 0, 0, 0);
-    float power = -dot(i.pos, i.pos);
-    half alpha = exp(power);
+    
+    float pos2 = dot(i.pos, i.pos);
+    // pos is (-2, 2), a circle inside a quad, we do not need the corner part, early out.
+    if (pos2 > 4.0)
+        discard;
+
+    half alpha = (half)exp(-pos2);
+
     if (i.col.a >= 0)
     {
         alpha = saturate(alpha * i.col.a);

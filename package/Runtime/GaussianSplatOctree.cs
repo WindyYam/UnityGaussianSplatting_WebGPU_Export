@@ -22,6 +22,7 @@ namespace GaussianSplatting.Runtime
         public class OctreeNode
         {
             public Bounds bounds;
+            public Vector3 center;
             // For leaf nodes we store original splat indices that lie within this node's bounds.
             // For internal nodes this may be null or empty.
             public List<int> splatIndices;
@@ -189,6 +190,7 @@ namespace GaussianSplatting.Runtime
             var rootNode = new OctreeNode
             {
                 bounds = m_RootBounds,
+                center = m_RootBounds.center,
                 splatIndices = null,
                 childIndices = null,
                 isLeaf = false,
@@ -229,6 +231,9 @@ namespace GaussianSplatting.Runtime
                 }
                 m_OutlierRingRadius = (float)(accum / othersCount);
             }
+
+            // Tighten bounding boxes starting from leaves and propagating up
+            TightenBounds();
 
             m_Built = true;
 
@@ -283,9 +288,8 @@ namespace GaussianSplatting.Runtime
             node.isLeaf = false;
             m_Nodes[nodeIndex] = node;
 
-            // Compute child centers (keep parent center positioning) but defer computing tight bounds
-            var childCenters = new Vector3[8];
-            var defaultChildSize = size; // fallback size for empty children
+            // Create child bounds
+            var childBounds = new Bounds[8];
             for (int i = 0; i < 8; i++)
             {
                 var offset = new Vector3(
@@ -293,7 +297,7 @@ namespace GaussianSplatting.Runtime
                     (i & 2) != 0 ? size.y * 0.5f : -size.y * 0.5f,
                     (i & 4) != 0 ? size.z * 0.5f : -size.z * 0.5f
                 );
-                childCenters[i] = center + offset;
+                childBounds[i] = new Bounds(center + offset, size);
             }
 
             // Distribute splats to children
@@ -320,52 +324,17 @@ namespace GaussianSplatting.Runtime
                 childSplatsIdx[childIndex].Add(infoIdx);
             }
 
-            // Create child nodes. For children that contain splats, compute a tight bound
-            // around their assigned splats while keeping the computed child center.
+            // Create child nodes
             for (int i = 0; i < 8; i++)
             {
-                Bounds b;
-                var centerOfChild = childCenters[i];
-                if (childSplatsIdx[i].Count > 0)
-                {
-                    // Compute tight min/max of splat positions for this child
-                    Vector3 min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
-                    Vector3 max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
-                    for (int si = 0; si < childSplatsIdx[i].Count; si++)
-                    {
-                        int infoIdx = childSplatsIdx[i][si];
-                        var p = (Vector3)m_SplatInfos[infoIdx].position;
-                        min = Vector3.Min(min, p);
-                        max = Vector3.Max(max, p);
-                    }
-
-                    // Compute half-extent required to cover splats while keeping the child center fixed.
-                    float halfX = Mathf.Max(Mathf.Abs(max.x - centerOfChild.x), Mathf.Abs(centerOfChild.x - min.x));
-                    float halfY = Mathf.Max(Mathf.Abs(max.y - centerOfChild.y), Mathf.Abs(centerOfChild.y - min.y));
-                    float halfZ = Mathf.Max(Mathf.Abs(max.z - centerOfChild.z), Mathf.Abs(centerOfChild.z - min.z));
-
-                    // Ensure a small non-zero size to avoid degenerate bounds
-                    const float kMinExtent = 1e-4f;
-                    halfX = Mathf.Max(halfX, kMinExtent);
-                    halfY = Mathf.Max(halfY, kMinExtent);
-                    halfZ = Mathf.Max(halfZ, kMinExtent);
-
-                    var finalSize = new Vector3(halfX * 2f, halfY * 2f, halfZ * 2f);
-                    b = new Bounds(centerOfChild, finalSize);
-                }
-                else
-                {
-                    // Empty child - use default half-size box centered at computed child center
-                    b = new Bounds(centerOfChild, defaultChildSize);
-                }
-
                 var childNode = new OctreeNode
                 {
-                    bounds = b,
+                    bounds = childBounds[i],
+                    center = childBounds[i].center,
                     splatIndices = null,
                     childIndices = null,
                     isLeaf = childSplatsIdx[i].Count == 0,
-                    maxExtent = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z))
+                    maxExtent = Mathf.Max(childBounds[i].extents.x, Mathf.Max(childBounds[i].extents.y, childBounds[i].extents.z))
                 };
 
                 int childNodeIndex = m_Nodes.Count;
@@ -382,6 +351,160 @@ namespace GaussianSplatting.Runtime
                     BuildRecursive(childNodeIndex, depth + 1, childSplatsIdx[i]);
                 }
             }
+        }
+
+        /// <summary>
+        /// Tighten bounding boxes for all nodes based on actual splat positions.
+        /// Starts from leaf nodes and propagates up to parent nodes.
+        /// </summary>
+        void TightenBounds()
+        {
+            if (m_Nodes.Count == 0)
+                return;
+
+            int tightenedNodes = 0;
+            
+            // Process nodes in reverse order to handle leaves first, then propagate up
+            for (int i = m_Nodes.Count - 1; i >= 0; i--)
+            {
+                if (TightenNodeBounds(i))
+                    tightenedNodes++;
+            }
+
+            Debug.Log($"Octree bounds tightened: {tightenedNodes}/{m_Nodes.Count} nodes updated");
+        }
+
+        /// <summary>
+        /// Tighten the bounds of a specific node based on its splats or child bounds.
+        /// </summary>
+        /// <returns>True if the bounds were changed, false otherwise</returns>
+        bool TightenNodeBounds(int nodeIndex)
+        {
+            if (nodeIndex >= m_Nodes.Count)
+                return false;
+
+            var node = m_Nodes[nodeIndex];
+            var originalBounds = node.bounds;
+
+            if (node.isLeaf)
+            {
+                // For leaf nodes, calculate tight bounds based on actual splat positions
+                if (node.splatIndices != null && node.splatIndices.Count > 0)
+                {
+                    // Get first splat position to initialize bounds
+                    int firstSplatIdx = node.splatIndices[0];
+                    if (m_OriginalIndexToPosition.TryGetValue(firstSplatIdx, out float3 firstPos))
+                    {
+                        float3 min = firstPos;
+                        float3 max = firstPos;
+
+                        // Expand bounds to include all splats in this leaf
+                        for (int i = 1; i < node.splatIndices.Count; i++)
+                        {
+                            int splatIdx = node.splatIndices[i];
+                            if (m_OriginalIndexToPosition.TryGetValue(splatIdx, out float3 pos))
+                            {
+                                min = math.min(min, pos);
+                                max = math.max(max, pos);
+                            }
+                        }
+
+                        // Update node bounds with tight fit
+                        Vector3 center = (Vector3)((min + max) * 0.5f);
+                        Vector3 size = (Vector3)(max - min);
+                        
+                        // Ensure minimum size to avoid zero-size bounds
+                        const float minSize = 0.001f;
+                        size.x = Mathf.Max(size.x, minSize);
+                        size.y = Mathf.Max(size.y, minSize);
+                        size.z = Mathf.Max(size.z, minSize);
+
+                        node.bounds = new Bounds(center, size);
+                        node.maxExtent = Mathf.Max(size.x, Mathf.Max(size.y, size.z)) * 0.5f;
+
+                        // Update the node in the list
+                        m_Nodes[nodeIndex] = node;
+                        
+                        // Check if bounds actually changed
+                        return !BoundsAreEqual(originalBounds, node.bounds);
+                    }
+                }
+                return false; // No splats, bounds unchanged
+            }
+            else
+            {
+                // For internal nodes, calculate bounds based on child node bounds
+                if (node.childIndices != null && node.childIndices.Count > 0)
+                {
+                    bool hasValidChild = false;
+                    float3 min = float3.zero;
+                    float3 max = float3.zero;
+
+                    foreach (int childIndex in node.childIndices)
+                    {
+                        if (childIndex < m_Nodes.Count)
+                        {
+                            var childNode = m_Nodes[childIndex];
+                            
+                            // Only include non-empty children in bounds calculation
+                            bool childHasContent = childNode.isLeaf 
+                                ? (childNode.splatIndices != null && childNode.splatIndices.Count > 0)
+                                : (childNode.childIndices != null && childNode.childIndices.Count > 0);
+
+                            if (childHasContent)
+                            {
+                                Vector3 childMin = childNode.bounds.min;
+                                Vector3 childMax = childNode.bounds.max;
+
+                                if (!hasValidChild)
+                                {
+                                    min = (float3)childMin;
+                                    max = (float3)childMax;
+                                    hasValidChild = true;
+                                }
+                                else
+                                {
+                                    min = math.min(min, (float3)childMin);
+                                    max = math.max(max, (float3)childMax);
+                                }
+                            }
+                        }
+                    }
+
+                    // Update bounds if we found valid children
+                    if (hasValidChild)
+                    {
+                        Vector3 center = (Vector3)((min + max) * 0.5f);
+                        Vector3 size = (Vector3)(max - min);
+                        
+                        // Ensure minimum size to avoid zero-size bounds
+                        const float minSize = 0.001f;
+                        size.x = Mathf.Max(size.x, minSize);
+                        size.y = Mathf.Max(size.y, minSize);
+                        size.z = Mathf.Max(size.z, minSize);
+
+                        node.bounds = new Bounds(center, size);
+                        node.maxExtent = Mathf.Max(size.x, Mathf.Max(size.y, size.z)) * 0.5f;
+
+                        // Update the node in the list
+                        m_Nodes[nodeIndex] = node;
+                        
+                        // Check if bounds actually changed
+                        return !BoundsAreEqual(originalBounds, node.bounds);
+                    }
+                }
+                return false; // No valid children, bounds unchanged
+            }
+        }
+
+        /// <summary>
+        /// Helper method to compare two bounds for equality with small tolerance.
+        /// </summary>
+        bool BoundsAreEqual(Bounds a, Bounds b)
+        {
+            const float tolerance = 1e-6f;
+            return Vector3.Distance(a.center, b.center) < tolerance && 
+                   Vector3.Distance(a.size, b.size) < tolerance;
         }
 
         /// <summary>
@@ -945,7 +1068,7 @@ namespace GaussianSplatting.Runtime
             {
                 Vector3 nodeCenter = node.bounds.center;
                 Vector3 oldDirection = (nodeCenter - node.lastSortCameraPosition).normalized;
-                Vector3 newDirection = (nodeCenter - camPosition).normalized;
+                Vector3 newDirection = (nodeCenter - oldDirection * node.maxExtent - camPosition).normalized;
 
                 float cosineAngle = Vector3.Dot(oldDirection, newDirection);
                 if (cosineAngle >= sortDirectionThreshold)
@@ -1012,7 +1135,7 @@ namespace GaussianSplatting.Runtime
             {
                 if (node.splatIndices != null && node.splatIndices.Count > 0)
                 {
-                    float nodeDistance = (node.bounds.center - camPosition).sqrMagnitude;
+                    float nodeDistance = (node.center - camPosition).sqrMagnitude;
                     m_VisibleNodeRefs.Add(new VisibleNodeRef
                     {
                         distance = nodeDistance,
