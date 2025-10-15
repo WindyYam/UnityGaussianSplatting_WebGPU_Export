@@ -8,7 +8,7 @@ This fork originally followed the `stochastic` branch of the original project an
 
 As a result, this is a portability-focused fork primarily targeting WebGPU with high visual fidelity splat rendering that works well on constrained / upcoming WebGPU platforms. To maximize compatibility on Web and WASM, the implementation favors CPU-side hierarchical culling and small per-node sorts (which run in parallel when available) rather than relying on large, complex GPU-only global sorts.
 
-Edit: Not until later I realise on most browser there is only 1 available thread core, so parellel sort doesn't benefit too much in WebGPU, then why the heck it looks visually fast? I've no idea to to this, maybe the sort overhead is much less than I'd thought?
+Edit: Not until later I realise WASM thread is not available in Unity C# at the moment, so parellel sort doesn't work in WebGPU at all(sad), then why the heck it looks visually fast? I've no idea to to this, maybe the sort overhead is much less than I'd thought? Or the cache node optimization is very good here?
 
 ## Highlights
 - Hierarchical octree build (configurable depth & leaf capacity) + outlier bucket.
@@ -26,7 +26,7 @@ Edit: Not until later I realise on most browser there is only 1 available thread
    - Frustum cull nodes.
    - Gather visible leaves.
    - Sort visible leaves (by node center distance, not precise, but until we find better solution).
-   - Kick off parallel per-leaf sorts in the background (non‑blocking). Per-leaf sorting runs asynchronously and updates per-node cached orderings when complete.
+   - Kick off parallel per-leaf sorts in the background (non‑blocking) or main thread depending on platform. Per-leaf sorting runs asynchronously and updates per-node cached orderings when complete.
    - Concatenate currently available per-node indices by leaves sort order into a single GPU buffer consumed by the renderer; updated orderings are picked up on subsequent frames once background sorts finish.
 
 Note: The GaussianExample-URP package includes a ready-to-play scene named "Barangaroo".
@@ -35,8 +35,8 @@ Note: The GaussianExample-URP package includes a ready-to-play scene named "Bara
 | Setting | Description | Guidance |
 |---------|-------------|----------|
 | `maxDepth`, `maxSplatsPerLeaf` | Octree granularity | Tune so typical visible leaf has ~1024 splats |
-| `enableParallelSorting` | Toggle multi-thread path | Always leave on for obvious reason, even if no multicore support, it can still run in background |
-| `parallelSortThreads` | Requested worker threads | Default 256 (just in case you have 256 cores) and will clamped to hardware & visible leaf count |
+| `enableParallelSorting` | Toggle multi-thread path | Put it on, will be automatically disabled in Web platform |
+| `parallelSortThreads` | Requested worker threads | Default 8 and will be set to hardware number |
 
 Recommended defaults and guidance:
 - Keep node sizes reasonable so per-leaf sorts stay cheap. A good starting point for many scenes is `maxDepth = 8` and `maxSplatsPerLeaf = 1024`.
@@ -44,7 +44,6 @@ Recommended defaults and guidance:
 
 ## Roadmap / Limitations
 - If you only target high-end native, reintroducing a global GPU radix sort could still win at extreme (> tens of millions) visible splat counts.
-- Experimenting with BVH (bounding volume hierarchy) trees as an alternative spatial structure — BVH may better suit very sparse splat distributions by improving culling and reducing per-frame sorting work.
 - The visible-node sort used at runtime is an approximation for splat ordering and may need a more robust artifact-free solution.
 
 ## License

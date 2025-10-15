@@ -77,7 +77,7 @@ namespace GaussianSplatting.Runtime
         readonly List<VisibleNodeRef> m_VisibleNodeRefs = new();        // Enable / disable parallel sorting (public for runtime tuning)
         public bool enableParallelSorting = true;
         // Configurable number of worker threads for node sorting (excluding main thread)
-        public int parallelSortThreads = 256; // clamped at runtime
+        public int parallelSortThreads = 8; // Default sort threads, Safe for most of the platform
         // Angular threshold for re-sorting: minimum cosine of angle change before re-sort is needed
         // cosine(15°) ≈ 0.966, cosine(30°) ≈ 0.866, cosine(45°) ≈ 0.707
         public float sortDirectionThreshold = 0.9f; // ~25.8° angle change threshold
@@ -112,7 +112,26 @@ namespace GaussianSplatting.Runtime
             // Print available system cores (both .NET and Unity reports)
             int envCores = Environment.ProcessorCount;
             int unityCores = SystemInfo.processorCount;
-            Debug.Log($"Available cores - Environment.ProcessorCount: {envCores}, SystemInfo.processorCount: {unityCores}");
+            Debug.Log($"Available cores - Environment.ProcessorCount: {envCores}, SystemInfo.processorCount: {unityCores} (Might not be accurate on Web platform)");
+
+            // In WebGPU platform, SystemInfo.processorCount is not reliable.
+            bool isWebPlatform = Application.platform == RuntimePlatform.WebGLPlayer;
+            if (isWebPlatform)
+            {
+                // WebGL / Web platform does not reliably support multithreading in Unity.
+                // Disable parallel sorting and fall back to single-threaded path.
+                enableParallelSorting = false;
+                Debug.LogWarning("GaussianSplatOctree: Web platform detected — threading is not supported in Unity(unfortunately). Disabling parallel sorting and using single-threaded sorting fallback.");
+            }
+            else
+            {
+                int reportedCores = SystemInfo.processorCount;
+                if (reportedCores > 0)
+                    parallelSortThreads = reportedCores;
+            }
+            if(enableParallelSorting)
+                // Inform about the number of threads that will be used for parallel sorting
+                Debug.Log($"GaussianSplatOctree: parallelSortThreads set to {parallelSortThreads}");
         }
 
         /// <summary>
@@ -756,9 +775,7 @@ namespace GaussianSplatting.Runtime
                 // Sequential path: outliers first (they are assumed farthest)
                 if (m_OthersIndices.Count > 0)
                 {
-                    if (ShouldResortOutliers(camPosition))
-                        SortOutliers(camPosition);
-                    m_VisibleSplatIndices.AddRange(m_OthersIndices);
+                    SortOutliers(camPosition);
                 }
                 for (int i = 0; i < m_VisibleNodeRefs.Count; i++)
                 {
@@ -824,6 +841,8 @@ namespace GaussianSplatting.Runtime
 
         void SortOutliers(Vector3 camPosition)
         {
+            if (!ShouldResortOutliers(camPosition))
+                return;
             if (m_OthersIndices.Count > 1)
                 SortSplatsInNode(m_OthersIndices, camPosition);
             m_OthersSorted = true;
@@ -911,8 +930,7 @@ namespace GaussianSplatting.Runtime
             }
 
             // Clamp desired worker count based on actual work
-            int hwThreads = Mathf.Max(1, SystemInfo.processorCount - 1); // leave 1 for main
-            int workers = Mathf.Clamp(parallelSortThreads, 1, hwThreads);
+            int workers = parallelSortThreads;
             workers = Mathf.Min(workers, sortNodeCount); // not more workers than nodes to sort
             if (workers <= 1)
             {
