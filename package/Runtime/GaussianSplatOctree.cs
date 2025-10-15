@@ -78,8 +78,6 @@ namespace GaussianSplatting.Runtime
         public bool enableParallelSorting = true;
         // Configurable number of worker threads for node sorting (excluding main thread)
         public int parallelSortThreads = 256; // clamped at runtime
-        // Minimum visible node count before attempting parallel sort
-        const int k_ParallelNodeThreshold = 4;
         // Angular threshold for re-sorting: minimum cosine of angle change before re-sort is needed
         // cosine(15°) ≈ 0.966, cosine(30°) ≈ 0.866, cosine(45°) ≈ 0.707
         public float sortDirectionThreshold = 0.9f; // ~25.8° angle change threshold
@@ -110,6 +108,11 @@ namespace GaussianSplatting.Runtime
         {
             m_MaxDepth = maxDepth;
             m_MaxSplatsPerLeaf = maxSplatsPerLeaf;
+
+            // Print available system cores (both .NET and Unity reports)
+            int envCores = Environment.ProcessorCount;
+            int unityCores = SystemInfo.processorCount;
+            Debug.Log($"Available cores - Environment.ProcessorCount: {envCores}, SystemInfo.processorCount: {unityCores}");
         }
 
         /// <summary>
@@ -720,14 +723,14 @@ namespace GaussianSplatting.Runtime
             var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(camera);
             CollectVisibleNodesWithDistance(0, frustumPlanes, camPosition);
 
-            bool doParallel = enableParallelSorting && SystemInfo.processorCount > 1 && m_VisibleNodeRefs.Count >= k_ParallelNodeThreshold;
-            if (doParallel)
+            if (enableParallelSorting)
             {
                 // Non-blocking check: set a flag indicating whether previous sort tasks have finished.
                 // Do not block/wait here — caller can poll this flag if needed.
                 bool previousSortTasksCompleted = true;
                 if (m_SortTasks != null)
                 {
+                    int taskListSize = m_SortTasks.Length;
                     for (int i = 0; i < m_SortTasks.Length; i++)
                     {
                         var t = m_SortTasks[i];
@@ -919,39 +922,15 @@ namespace GaussianSplatting.Runtime
                 {
                     seqTask = Task.Run(() =>
                     {
-                        try
+                        // Process from back to front for visual priority (closer nodes processed first)
+                        for (int i = sortNodeCount - 1; i >= 0; i--)
                         {
-                            // Process from back to front for visual priority (closer nodes processed first)
-                            for (int i = sortNodeCount - 1; i >= 0; i--)
-                            {
-                                int nodeRefIndex = nodesToSort[i];
-                                var nodeRef = snapshot[nodeRefIndex];
-                                var node = m_Nodes[nodeRef.nodeIndex];
-                                SortSplatsInNodeThreadSafe(node.splatIndices, camPosition);
-                                node.isSorted = true;
-                                node.lastSortCameraPosition = camPosition;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogError($"Sequential worker task exception: {ex}");
-                            // Fallback: try sequential (non-thread-safe) sort on main thread as last resort
-                            for (int i = sortNodeCount - 1; i >= 0; i--)
-                            {
-                                int nodeRefIndex = nodesToSort[i];
-                                var nodeRef = snapshot[nodeRefIndex];
-                                var node = m_Nodes[nodeRef.nodeIndex];
-                                try
-                                {
-                                    SortSplatsInNode(node.splatIndices, camPosition);
-                                    node.isSorted = true;
-                                    node.lastSortCameraPosition = camPosition;
-                                }
-                                catch (Exception fallbackEx)
-                                {
-                                    Debug.LogError($"Fallback sequential sorting also failed: {fallbackEx}");
-                                }
-                            }
+                            int nodeRefIndex = nodesToSort[i];
+                            var nodeRef = snapshot[nodeRefIndex];
+                            var node = m_Nodes[nodeRef.nodeIndex];
+                            SortSplatsInNodeThreadSafe(node.splatIndices, camPosition);
+                            node.isSorted = true;
+                            node.lastSortCameraPosition = camPosition;
                         }
                     });
                 }
