@@ -8,6 +8,8 @@ This fork originally followed the `stochastic` branch of the original project an
 
 As a result, this is a portability-focused fork primarily targeting WebGPU with high visual fidelity splat rendering that works well on constrained / upcoming WebGPU platforms. To maximize compatibility on Web and WASM, the implementation favors CPU-side hierarchical culling and small per-node sorts (which run in parallel when available) rather than relying on large, complex GPU-only global sorts.
 
+Edit: Not until later I realise on most browser there is only 1 available thread core, so parellel sort doesn't benefit too much in WebGPU, then why the heck it looks visually fast? I've no idea to to this, maybe the sort overhead is much less than I'd thought?
+
 ## Highlights
 - Hierarchical octree build (configurable depth & leaf capacity) + outlier bucket.
 - Frustum culling at node granularity drastically reduces sort domain.
@@ -33,7 +35,7 @@ Note: The GaussianExample-URP package includes a ready-to-play scene named "Bara
 | Setting | Description | Guidance |
 |---------|-------------|----------|
 | `maxDepth`, `maxSplatsPerLeaf` | Octree granularity | Tune so typical visible leaf has ~1024 splats |
-| `enableParallelSorting` | Toggle multi-thread path | Always leave on for obvious reason |
+| `enableParallelSorting` | Toggle multi-thread path | Always leave on for obvious reason, even if no multicore support, it can still run in background |
 | `parallelSortThreads` | Requested worker threads | Default 256 (just in case you have 256 cores) and will clamped to hardware & visible leaf count |
 
 Recommended defaults and guidance:
