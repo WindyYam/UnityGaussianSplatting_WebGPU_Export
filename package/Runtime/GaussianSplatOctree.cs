@@ -78,6 +78,9 @@ namespace GaussianSplatting.Runtime
         public bool enableParallelSorting = true;
         // Configurable number of worker threads for node sorting (excluding main thread)
         public int parallelSortThreads = 8; // Default sort threads, Safe for most of the platform
+        // Maximum number of nodes to sort per frame to ensure closest nodes are prioritized during camera movement
+        // This prevents frame time spikes by limiting sort work and ensures closest nodes are sorted first
+        public int maxSortNodesPerFrame = 256; // In sequential path we do sort over time
         // Angular threshold for re-sorting: minimum cosine of angle change before re-sort is needed
         // cosine(15°) ≈ 0.966, cosine(30°) ≈ 0.866, cosine(45°) ≈ 0.707
         public float sortDirectionThreshold = 0.9f; // ~25.8° angle change threshold
@@ -876,10 +879,16 @@ namespace GaussianSplatting.Runtime
                 {
                     SortOutliers(camPosition);
                 }
-                for (int i = 0; i < m_VisibleNodeRefs.Count; i++)
+                // Limit sorting to closest nodes per frame for better performance during camera movement
+                int nodesToSort = Mathf.Min(m_VisibleNodeRefs.Count, maxSortNodesPerFrame);
+                int nodesSorted = 0;
+                for (int i = m_VisibleNodeRefs.Count - 1; i >= 0 && nodesSorted < nodesToSort; i--)
                 {
                     var nodeRef = m_VisibleNodeRefs[i];
-                    SortNodeSplats(nodeRef.nodeIndex, camPosition);
+                    if (SortNodeSplats(nodeRef.nodeIndex, camPosition))
+                    {
+                        nodesSorted++;
+                    }
                 }
             }
             // Append nodes in distance order (their lists now internally sorted and persistent)
@@ -1531,11 +1540,11 @@ namespace GaussianSplatting.Runtime
         /// <summary>
         /// Sort splats in a node and mark it as sorted for the current camera view.
         /// </summary>
-        public void SortNodeSplats(int nodeIndex, Vector3 camPosition, bool forceSort = false)
+        public bool SortNodeSplats(int nodeIndex, Vector3 camPosition, bool forceSort = false)
         {
-            if (nodeIndex < 0 || nodeIndex >= m_Nodes.Count) return;
+            if (nodeIndex < 0 || nodeIndex >= m_Nodes.Count) return false;
             var node = m_Nodes[nodeIndex];
-            if (node.splatIndices == null || node.splatIndices.Count <= 1) return;
+            if (node.splatIndices == null || node.splatIndices.Count <= 1) return false;
 
             if (!forceSort && node.isSorted)
             {
@@ -1545,12 +1554,13 @@ namespace GaussianSplatting.Runtime
 
                 float cosineAngle = Vector3.Dot(oldDirection, newDirection);
                 if (cosineAngle >= sortDirectionThreshold)
-                    return;
+                    return false;
             }
 
             SortSplatsInNode(node.splatIndices, camPosition);
             node.isSorted = true;
             node.lastSortCameraPosition = camPosition;
+            return true;
         }
 
         /// <summary>
