@@ -24,7 +24,7 @@ namespace GaussianSplatting.Runtime
             public Bounds bounds;
             public Vector3 center;
             // For leaf nodes we store original splat indices that lie within this node's bounds.
-            // For internal nodes this may be null or empty.
+            // For internal nodes this may be null or empty, will be sorted.
             public List<int> splatIndices;
             // Child node indices (indices into m_Nodes). Null or empty for leaf nodes.
             public List<int> childIndices;
@@ -35,6 +35,9 @@ namespace GaussianSplatting.Runtime
             public Vector3 lastSortCameraPosition;
             // Cached maximum extent (largest half-size axis) for angular sort threshold calculations
             public float maxExtent;
+            // Persistent native copy of splat indices for native sorting (read-only input).
+            public NativeArray<int> nativeSplatIndices;
+            public bool nativeIndicesValid;
         }
 
         public struct SplatInfo
@@ -44,7 +47,8 @@ namespace GaussianSplatting.Runtime
         }
 
         readonly List<OctreeNode> m_Nodes = new();
-        readonly List<int> m_VisibleSplatIndices = new();
+        NativeArray<int> m_VisibleSplatIndices;
+        bool m_VisibleSplatIndicesValid;
         int m_TotalSplats; // Persist total splat count after releasing build-time list
 
         // Configuration
@@ -58,7 +62,10 @@ namespace GaussianSplatting.Runtime
 
         // Outlier splat indices that lie outside the main root bounds (always included in culling)
         readonly List<int> m_OthersIndices = new();
-
+        // Persistent native copy of outlier indices (read-only input for native sort). Lazy-init.
+        NativeArray<int> m_OthersNativeIndices;
+        bool m_OthersNativeValid;
+        
         // Reusable array for distance sorting to avoid allocations
         (float distance, int index)[] m_DistanceSortArray;
 
@@ -106,8 +113,9 @@ namespace GaussianSplatting.Runtime
             public bool isOutlierJob;
             public int nodeIndex; // -1 for outlier jobs
             public Vector3 cameraPosition;
-            public NativeArray<int> inputIndices; // Per-job input splat indices
+            public NativeArray<int> inputIndices; // Per-job input splat indices (owned by job if disposeInput == true)
             public NativeArray<int> sortedIndices; // Per-job output sorted indices
+            public bool disposeInput; // Whether we should dispose inputIndices when job completes
         }
 
         public int nodeCount => m_Nodes.Count;
@@ -126,6 +134,31 @@ namespace GaussianSplatting.Runtime
             }
             pos = default;
             return false;
+        }
+
+        // Helper to ensure the visible splat indices native array is large enough
+        void EnsureVisibleSplatIndicesCapacity(int requiredCapacity)
+        {
+            if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated || m_VisibleSplatIndices.Length < requiredCapacity)
+            {
+                if (m_VisibleSplatIndicesValid && m_VisibleSplatIndices.IsCreated)
+                {
+                    try { m_VisibleSplatIndices.Dispose(); } catch {}
+                }
+                
+                // Allocate with some extra space to avoid frequent reallocations
+                int bufferSize = Mathf.NextPowerOfTwo(Mathf.Max(requiredCapacity, 1));
+                try
+                {
+                    m_VisibleSplatIndices = new NativeArray<int>(bufferSize, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                    m_VisibleSplatIndicesValid = true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"Failed to allocate visible splat indices native array: {ex.Message}");
+                    m_VisibleSplatIndicesValid = false;
+                }
+            }
         }
 
         /// <summary>
@@ -591,22 +624,46 @@ namespace GaussianSplatting.Runtime
             if (!m_Built)
                 return 0;
 
-            m_VisibleSplatIndices.Clear();
+            // Estimate capacity needed (total splats as upper bound)
+            int estimatedCapacity = m_TotalSplats;
+            EnsureVisibleSplatIndicesCapacity(estimatedCapacity);
+
+            if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
+            {
+                visibleSplatCount = 0;
+                return 0;
+            }
 
             // Extract frustum planes from camera
             var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(camera);
 
             // Traverse octree and collect visible splats
-            CullNodeRecursive(0, frustumPlanes);
+            int currentIndex = 0;
+            CullNodeRecursive(0, frustumPlanes, ref currentIndex);
 
             // Always include 'others' outlier splats
             if (m_OthersIndices.Count > 0)
             {
-                // Fast bulk append outlier indices
-                m_VisibleSplatIndices.AddRange(m_OthersIndices);
+                // Ensure we have enough space for outliers
+                if (currentIndex + m_OthersIndices.Count > m_VisibleSplatIndices.Length)
+                {
+                    EnsureVisibleSplatIndicesCapacity(currentIndex + m_OthersIndices.Count);
+                    if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
+                    {
+                        visibleSplatCount = 0;
+                        return 0;
+                    }
+                }
+                
+                // Copy outlier indices
+                for (int i = 0; i < m_OthersIndices.Count; i++)
+                {
+                    m_VisibleSplatIndices[currentIndex + i] = m_OthersIndices[i];
+                }
+                currentIndex += m_OthersIndices.Count;
             }
 
-            visibleSplatCount = m_VisibleSplatIndices.Count;
+            visibleSplatCount = currentIndex;
 
             // Update GPU buffer
             UpdateVisibleIndicesBuffer();
@@ -614,7 +671,7 @@ namespace GaussianSplatting.Runtime
             return visibleSplatCount;
         }
 
-        void CullNodeRecursive(int nodeIndex, Plane[] frustumPlanes)
+        void CullNodeRecursive(int nodeIndex, Plane[] frustumPlanes, ref int currentIndex)
         {
             if (nodeIndex >= m_Nodes.Count)
                 return;
@@ -630,7 +687,20 @@ namespace GaussianSplatting.Runtime
                 // Add all splats in this leaf to visible list (skip empty leaves)
                 if (node.splatIndices != null && node.splatIndices.Count > 0)
                 {
-                    m_VisibleSplatIndices.AddRange(node.splatIndices);
+                    // Ensure we have enough space
+                    if (currentIndex + node.splatIndices.Count > m_VisibleSplatIndices.Length)
+                    {
+                        EnsureVisibleSplatIndicesCapacity(currentIndex + node.splatIndices.Count);
+                        if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
+                            return;
+                    }
+                    
+                    // Copy splat indices
+                    for (int i = 0; i < node.splatIndices.Count; i++)
+                    {
+                        m_VisibleSplatIndices[currentIndex + i] = node.splatIndices[i];
+                    }
+                    currentIndex += node.splatIndices.Count;
                 }
             }
             else
@@ -646,7 +716,7 @@ namespace GaussianSplatting.Runtime
                             var childNode = m_Nodes[childIndex];
                             if ((childNode.splatIndices != null && childNode.splatIndices.Count > 0) || !childNode.isLeaf)
                             {
-                                CullNodeRecursive(childIndex, frustumPlanes);
+                                CullNodeRecursive(childIndex, frustumPlanes, ref currentIndex);
                             }
                         }
                     }
@@ -658,6 +728,12 @@ namespace GaussianSplatting.Runtime
         {
             if (visibleSplatCount == 0)
                 return;
+
+            if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
+            {
+                Debug.LogWarning("Visible splat indices native array is invalid during buffer update");
+                return;
+            }
 
             // Ensure buffer is large enough
             int requiredSize = visibleSplatCount;
@@ -672,14 +748,22 @@ namespace GaussianSplatting.Runtime
                 };
             }
 
-            // Convert to uint array and upload visible indices
-            var nativeArray = new NativeArray<uint>(visibleSplatCount, Allocator.Temp);
-            for (int i = 0; i < visibleSplatCount; i++)
+            // Upload visible indices directly from native array (reinterpret cast from int to uint)
+            unsafe
             {
-                nativeArray[i] = (uint)m_VisibleSplatIndices[i];
+                // Create a NativeArray<uint> view of our int data (reinterpret cast)
+                var uintView = NativeArrayUnsafeUtility.ConvertExistingDataToNativeArray<uint>(
+                    (void*)m_VisibleSplatIndices.GetUnsafeReadOnlyPtr(),
+                    visibleSplatCount,
+                    Allocator.None);
+                
+                #if ENABLE_UNITY_COLLECTIONS_CHECKS
+                NativeArrayUnsafeUtility.SetAtomicSafetyHandle(ref uintView, 
+                    NativeArrayUnsafeUtility.GetAtomicSafetyHandle(m_VisibleSplatIndices));
+                #endif
+                
+                m_VisibleIndicesBuffer.SetData(uintView, 0, 0, visibleSplatCount);
             }
-            m_VisibleIndicesBuffer.SetData(nativeArray, 0, 0, visibleSplatCount);
-            nativeArray.Dispose();
         }
 
         /// <summary>
@@ -758,9 +842,27 @@ namespace GaussianSplatting.Runtime
         {
             // Cleanup native sorting jobs
             CleanupNativeSortJobs();
-            
+            // Dispose per-node native buffers before clearing list
+            for (int i = 0; i < m_Nodes.Count; i++)
+            {
+                var n = m_Nodes[i];
+                if (n.nativeIndicesValid && n.nativeSplatIndices.IsCreated)
+                {
+                    try { n.nativeSplatIndices.Dispose(); } catch {}
+                    n.nativeIndicesValid = false;
+                }
+            }
+            if (m_OthersNativeValid && m_OthersNativeIndices.IsCreated)
+            {
+                try { m_OthersNativeIndices.Dispose(); } catch {}
+                m_OthersNativeValid = false;
+            }
             m_Nodes.Clear();
-            m_VisibleSplatIndices.Clear();
+            if (m_VisibleSplatIndicesValid && m_VisibleSplatIndices.IsCreated)
+            {
+                try { m_VisibleSplatIndices.Dispose(); } catch {}
+                m_VisibleSplatIndicesValid = false;
+            }
             m_VisibleNodeRefs.Clear();
             m_VisibleIndicesBuffer?.Dispose();
             m_VisibleIndicesBuffer = null;
@@ -801,11 +903,11 @@ namespace GaussianSplatting.Runtime
                 {
                     try { NativeSorting.CleanupJob(handle); } catch { }
                 }
-                // Dispose embedded buffers
+                var info = m_NativeJobInfos[i];
                 try
                 {
-                    if (m_NativeJobInfos[i].inputIndices.IsCreated) m_NativeJobInfos[i].inputIndices.Dispose();
-                    if (m_NativeJobInfos[i].sortedIndices.IsCreated) m_NativeJobInfos[i].sortedIndices.Dispose();
+                    if (info.disposeInput && info.inputIndices.IsCreated) info.inputIndices.Dispose();
+                    if (info.sortedIndices.IsCreated) info.sortedIndices.Dispose();
                 }
                 catch { }
                 m_NativeSortJobs.RemoveAt(i);
@@ -822,7 +924,17 @@ namespace GaussianSplatting.Runtime
             if (!m_Built)
                 return;
             var camPosition = camera.transform.position;
-            m_VisibleSplatIndices.Clear();
+            
+            // Estimate capacity and ensure native array is ready
+            int estimatedCapacity = m_TotalSplats;
+            EnsureVisibleSplatIndicesCapacity(estimatedCapacity);
+            
+            if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
+            {
+                visibleSplatCount = 0;
+                return;
+            }
+            
             m_VisibleNodeRefs.Clear();
             var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(camera);
             CollectVisibleNodesWithDistance(0, frustumPlanes, camPosition);
@@ -895,15 +1007,56 @@ namespace GaussianSplatting.Runtime
                 }
             }
             // Append nodes in distance order (their lists now internally sorted and persistent)
-            m_VisibleSplatIndices.AddRange(m_OthersIndices);
+            int currentIndex = 0;
+            
+            // First, add outliers
+            if (m_OthersIndices.Count > 0)
+            {
+                if (currentIndex + m_OthersIndices.Count > m_VisibleSplatIndices.Length)
+                {
+                    EnsureVisibleSplatIndicesCapacity(currentIndex + m_OthersIndices.Count);
+                    if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
+                    {
+                        visibleSplatCount = 0;
+                        return;
+                    }
+                }
+                
+                for (int i = 0; i < m_OthersIndices.Count; i++)
+                {
+                    m_VisibleSplatIndices[currentIndex + i] = m_OthersIndices[i];
+                }
+                currentIndex += m_OthersIndices.Count;
+            }
+            
+            // Then add node splats
             for (int i = 0; i < m_VisibleNodeRefs.Count; i++)
             {
                 var nodeRef = m_VisibleNodeRefs[i];
                 var node = m_Nodes[nodeRef.nodeIndex];
                 if (node.splatIndices != null && node.splatIndices.Count > 0)
-                    m_VisibleSplatIndices.AddRange(node.splatIndices);
+                {
+                    // Ensure we have enough space
+                    if (currentIndex + node.splatIndices.Count > m_VisibleSplatIndices.Length)
+                    {
+                        EnsureVisibleSplatIndicesCapacity(currentIndex + node.splatIndices.Count);
+                        if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
+                        {
+                            visibleSplatCount = currentIndex;
+                            UpdateVisibleIndicesBuffer();
+                            return;
+                        }
+                    }
+                    
+                    // Copy node splat indices
+                    for (int j = 0; j < node.splatIndices.Count; j++)
+                    {
+                        m_VisibleSplatIndices[currentIndex + j] = node.splatIndices[j];
+                    }
+                    currentIndex += node.splatIndices.Count;
+                }
             }
-            visibleSplatCount = m_VisibleSplatIndices.Count;
+            visibleSplatCount = currentIndex;
             UpdateVisibleIndicesBuffer();
         }
 
@@ -956,6 +1109,7 @@ namespace GaussianSplatting.Runtime
                 return;
             if (m_OthersIndices.Count > 1)
                 SortSplatsInNode(m_OthersIndices, camPosition);
+            // Removed native buffer sync to reduce overhead
             m_OthersSorted = true;
             m_LastOthersSortCamPos = camPosition;
         }
@@ -1228,14 +1382,23 @@ namespace GaussianSplatting.Runtime
             if (!m_AllPositionsNativeValid) return false;
             try
             {
-                var input = new NativeArray<int>(m_OthersIndices.Count, Allocator.Persistent);
+                bool usedPersistentInput = EnsureOutlierNativeIndices();
+                NativeArray<int> input;
+                if (usedPersistentInput)
+                {
+                    input = m_OthersNativeIndices;
+                }
+                else
+                {
+                    input = new NativeArray<int>(m_OthersIndices.Count, Allocator.Persistent);
+                    for (int i = 0; i < m_OthersIndices.Count; i++) input[i] = m_OthersIndices[i];
+                }
                 var output = new NativeArray<int>(m_OthersIndices.Count, Allocator.Persistent);
-                for (int i = 0; i < m_OthersIndices.Count; i++) input[i] = m_OthersIndices[i];
                 var handle = NativeSorting.StartSortJob(input, m_AllPositionsNative, output, camPosition);
                 if (!handle.IsValid)
                 {
-                    input.Dispose();
-                    output.Dispose();
+                    if (!usedPersistentInput && input.IsCreated) input.Dispose();
+                    if (output.IsCreated) output.Dispose();
                     return false;
                 }
                 m_NativeSortJobs.Add(handle);
@@ -1245,7 +1408,8 @@ namespace GaussianSplatting.Runtime
                     nodeIndex = -1,
                     cameraPosition = camPosition,
                     inputIndices = input,
-                    sortedIndices = output
+                    sortedIndices = output,
+                    disposeInput = !usedPersistentInput
                 });
                 return true;
             }
@@ -1268,14 +1432,25 @@ namespace GaussianSplatting.Runtime
             if (!m_AllPositionsNativeValid) return false;
             try
             {
-                var input = new NativeArray<int>(node.splatIndices.Count, Allocator.Persistent);
+                // Ensure persistent native splat index buffer exists for this node (lazy init)
+                bool usedPersistentInput = EnsureNodeNativeIndices(nodeIndex);
+                NativeArray<int> input;
+                if (usedPersistentInput)
+                {
+                    input = node.nativeSplatIndices; // already valid & persistent
+                }
+                else
+                {
+                    // Fallback (should rarely happen) allocate one-shot buffer
+                    input = new NativeArray<int>(node.splatIndices.Count, Allocator.Persistent);
+                    for (int i = 0; i < node.splatIndices.Count; i++) input[i] = node.splatIndices[i];
+                }
                 var output = new NativeArray<int>(node.splatIndices.Count, Allocator.Persistent);
-                for (int i = 0; i < node.splatIndices.Count; i++) input[i] = node.splatIndices[i];
                 var handle = NativeSorting.StartSortJob(input, m_AllPositionsNative, output, camPosition);
                 if (!handle.IsValid)
                 {
-                    input.Dispose();
-                    output.Dispose();
+                    if (!usedPersistentInput && input.IsCreated) input.Dispose();
+                    if (output.IsCreated) output.Dispose();
                     return false;
                 }
                 m_NativeSortJobs.Add(handle);
@@ -1285,7 +1460,8 @@ namespace GaussianSplatting.Runtime
                     nodeIndex = nodeIndex,
                     cameraPosition = camPosition,
                     inputIndices = input,
-                    sortedIndices = output
+                    sortedIndices = output,
+                    disposeInput = !usedPersistentInput
                 });
                 return true;
             }
@@ -1319,7 +1495,7 @@ namespace GaussianSplatting.Runtime
                 {
                     Debug.LogError($"Error collecting native sort results: {ex.Message}");
                 }
-                try { if (info.inputIndices.IsCreated) info.inputIndices.Dispose(); } catch { }
+                try { if (info.disposeInput && info.inputIndices.IsCreated) info.inputIndices.Dispose(); } catch { }
                 try { if (info.sortedIndices.IsCreated) info.sortedIndices.Dispose(); } catch { }
                 m_NativeSortJobs.RemoveAt(i);
                 m_NativeJobInfos.RemoveAt(i);
@@ -1335,6 +1511,7 @@ namespace GaussianSplatting.Runtime
             m_OthersIndices.Clear();
             for (int i = 0; i < sortedIndices.Length; i++)
                 m_OthersIndices.Add(sortedIndices[i]);
+            // Removed optional native buffer refresh to avoid overhead
             m_OthersSorted = true;
             m_LastOthersSortCamPos = camPosition;
         }
@@ -1358,6 +1535,7 @@ namespace GaussianSplatting.Runtime
             node.splatIndices.Clear();
             for (int i = 0; i < sortedIndices.Length; i++)
                 node.splatIndices.Add(sortedIndices[i]);
+            // Removed optional native indices refresh
             node.isSorted = true;
             node.lastSortCameraPosition = camPosition;
         }
@@ -1373,7 +1551,7 @@ namespace GaussianSplatting.Runtime
                 if (!handle.IsCompleted) continue;
                 try { NativeSorting.CleanupJob(handle); } catch { }
                 var info = m_NativeJobInfos[i];
-                try { if (info.inputIndices.IsCreated) info.inputIndices.Dispose(); } catch { }
+                try { if (info.disposeInput && info.inputIndices.IsCreated) info.inputIndices.Dispose(); } catch { }
                 try { if (info.sortedIndices.IsCreated) info.sortedIndices.Dispose(); } catch { }
                 m_NativeSortJobs.RemoveAt(i);
                 m_NativeJobInfos.RemoveAt(i);
@@ -1506,6 +1684,59 @@ namespace GaussianSplatting.Runtime
                     SortNodeSplats(nodeRef.nodeIndex, camPosition);
                 }
             }
+        }
+
+        bool EnsureNodeNativeIndices(int nodeIndex)
+        {
+            if (nodeIndex < 0 || nodeIndex >= m_Nodes.Count) return false;
+            var node = m_Nodes[nodeIndex];
+            if (node.splatIndices == null || node.splatIndices.Count == 0) return false;
+            if (!node.nativeIndicesValid || !node.nativeSplatIndices.IsCreated || node.nativeSplatIndices.Length != node.splatIndices.Count)
+            {
+                // Dispose previous if size mismatch
+                if (node.nativeIndicesValid && node.nativeSplatIndices.IsCreated)
+                {
+                    try { node.nativeSplatIndices.Dispose(); } catch {}
+                }
+                try
+                {
+                    node.nativeSplatIndices = new NativeArray<int>(node.splatIndices.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                    for (int i = 0; i < node.splatIndices.Count; i++)
+                        node.nativeSplatIndices[i] = node.splatIndices[i];
+                    node.nativeIndicesValid = true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"Failed to allocate native splat index buffer for node {nodeIndex}: {ex.Message}");
+                    node.nativeIndicesValid = false;
+                }
+            }
+            return node.nativeIndicesValid;
+        }
+
+        bool EnsureOutlierNativeIndices()
+        {
+            if (m_OthersIndices.Count == 0) return false;
+            if (!m_OthersNativeValid || !m_OthersNativeIndices.IsCreated || m_OthersNativeIndices.Length != m_OthersIndices.Count)
+            {
+                if (m_OthersNativeValid && m_OthersNativeIndices.IsCreated)
+                {
+                    try { m_OthersNativeIndices.Dispose(); } catch {}
+                }
+                try
+                {
+                    m_OthersNativeIndices = new NativeArray<int>(m_OthersIndices.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                    for (int i = 0; i < m_OthersIndices.Count; i++)
+                        m_OthersNativeIndices[i] = m_OthersIndices[i];
+                    m_OthersNativeValid = true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"Failed to allocate native outlier index buffer: {ex.Message}");
+                    m_OthersNativeValid = false;
+                }
+            }
+            return m_OthersNativeValid;
         }
     }
 }
