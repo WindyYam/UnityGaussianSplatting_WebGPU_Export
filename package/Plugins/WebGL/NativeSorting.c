@@ -57,7 +57,7 @@ static inline float calc_distance_sq(const float* pos, float cam_x, float cam_y,
     return dx*dx + dy*dy + dz*dz;
 }
 
-// Comparison function for qsort - sort by distance (back to front)
+// Comparison function for qsort - sort by distance (front to back)
 typedef struct {
     float distance;
     int index;
@@ -67,9 +67,9 @@ static int compare_distances(const void* a, const void* b) {
     const distance_pair_t* pair_a = (const distance_pair_t*)a;
     const distance_pair_t* pair_b = (const distance_pair_t*)b;
     
-    // Sort back to front (larger distance first)
-    if (pair_a->distance > pair_b->distance) return -1;
-    if (pair_a->distance < pair_b->distance) return 1;
+    // Sort front to back (smaller distance first)
+    if (pair_a->distance < pair_b->distance) return -1;
+    if (pair_a->distance > pair_b->distance) return 1;
     return 0;
 }
 
@@ -108,7 +108,7 @@ static void process_sort_job(sort_job_t* job) {
         pairs[i].index = job->splat_indices[i];
     }
     
-    // Sort by distance (back to front)
+    // Sort by distance (front to back)
     qsort(pairs, job->splat_count, sizeof(distance_pair_t), compare_distances);
     
     // Copy sorted indices back

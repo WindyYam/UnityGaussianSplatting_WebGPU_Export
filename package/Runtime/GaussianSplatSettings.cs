@@ -80,7 +80,7 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Update culling every N frames (1 = every frame, higher = better performance but less precise)")]
         [Range(1, 20)] public int m_OctreeCullingUpdateInterval = 1;
 
-        [Tooltip("Ratio (0-1) of splats considered as 'screen' splats when building the octree. The remainder are treated as background splats(Always draw first in alpha blend mode).")]
+        [Tooltip("Ratio (0-1) of splats considered as 'screen' splats when building the octree. The remainder are treated as background splats(Always draw last in front-to-back alpha blend mode).")]
         [Range(0.0f, 1.0f)] public float m_OctreeSplatRatio = 0.9f;
 
         [Tooltip("Draw octree leaf bounds in the Scene view (OnDrawGizmos)")]
@@ -92,7 +92,7 @@ namespace GaussianSplatting.Runtime
 
         internal bool isDebugRender => m_RenderMode != DebugRenderMode.Splats;
 
-        // Sorting is needed for debug box rendering and alpha blending mode
+        // Sorting is needed for debug box rendering and front-to-back alpha blending mode
         internal bool needSorting => m_RenderMode == DebugRenderMode.DebugBoxes || m_Transparency == TransparencyMode.AlphaBlend;
 
         internal bool resourcesFound { get; private set; }

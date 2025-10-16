@@ -915,7 +915,7 @@ namespace GaussianSplatting.Runtime
         }
 
         /// <summary>
-        /// Sort visible splat indices by 3D distance from camera (back-to-front for alpha blending).
+        /// Sort visible splat indices by 3D distance from camera (front-to-back for alpha blending).
         /// Hierarchical sorting optimization.
         /// </summary>
         public void SortVisibleSplatsByDepth(Camera camera)
@@ -951,7 +951,7 @@ namespace GaussianSplatting.Runtime
                     }
                     
                     // Sort node references by distance while native work happens in background
-                    m_VisibleNodeRefs.Sort((a, b) => b.distance.CompareTo(a.distance));
+                    m_VisibleNodeRefs.Sort((a, b) => a.distance.CompareTo(b.distance)); // Front-to-back
                 }
                 else
                 {
@@ -974,8 +974,8 @@ namespace GaussianSplatting.Runtime
                     // Start the new parallel sort workers without blocking.
                     if(previousSortTasksCompleted)
                         m_SortTasks = ParallelSortVisibleNodes(camPosition);
-                    // Sort node references by distance (far-to-near for back-to-front rendering) while parallel work happens
-                    m_VisibleNodeRefs.Sort((a, b) => b.distance.CompareTo(a.distance));
+                    // Sort node references by distance (near-to-far for front-to-back rendering) while parallel work happens
+                    m_VisibleNodeRefs.Sort((a, b) => a.distance.CompareTo(b.distance)); // Front-to-back
                     // Now join the tasks after doing useful work on main thread (if desired)
                     // JoinParallelSortThreads(m_SortTasks);
                 }
@@ -983,8 +983,8 @@ namespace GaussianSplatting.Runtime
             else
             {
                 // Sequential path: sort nodes first, then process
-                m_VisibleNodeRefs.Sort((a, b) => b.distance.CompareTo(a.distance));
-                // Sequential path: outliers first (they are assumed farthest)
+                m_VisibleNodeRefs.Sort((a, b) => a.distance.CompareTo(b.distance)); // Front-to-back
+                // Sequential path: sort outliers (background elements processed last in front-to-back)
                 if (m_OthersIndices.Count > 0)
                 {
                     SortOutliers(camPosition);
@@ -992,7 +992,7 @@ namespace GaussianSplatting.Runtime
                 // Limit sorting to closest nodes per frame for better performance during camera movement
                 int nodesToSort = Mathf.Min(m_VisibleNodeRefs.Count, maxSortNodesPerFrame);
                 int nodesSorted = 0;
-                for (int i = m_VisibleNodeRefs.Count - 1; i >= 0 && nodesSorted < nodesToSort; i--)
+                for (int i = 0; i < m_VisibleNodeRefs.Count && nodesSorted < nodesToSort; i++) // Front-to-back processing
                 {
                     var nodeRef = m_VisibleNodeRefs[i];
                     if (SortNodeSplats(nodeRef.nodeIndex, camPosition))
@@ -1004,27 +1004,7 @@ namespace GaussianSplatting.Runtime
             // Append nodes in distance order (their lists now internally sorted and persistent)
             int currentIndex = 0;
             
-            // First, add outliers
-            if (m_OthersIndices.Count > 0)
-            {
-                if (currentIndex + m_OthersIndices.Count > m_VisibleSplatIndices.Length)
-                {
-
-                    if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
-                    {
-                        visibleSplatCount = 0;
-                        return;
-                    }
-                }
-                
-                for (int i = 0; i < m_OthersIndices.Count; i++)
-                {
-                    m_VisibleSplatIndices[currentIndex + i] = m_OthersIndices[i];
-                }
-                currentIndex += m_OthersIndices.Count;
-            }
-            
-            // Then add node splats
+            // First, add node splats (front elements for front-to-back rendering)
             for (int i = 0; i < m_VisibleNodeRefs.Count; i++)
             {
                 var nodeRef = m_VisibleNodeRefs[i];
@@ -1050,6 +1030,28 @@ namespace GaussianSplatting.Runtime
                     currentIndex += node.splatIndices.Count;
                 }
             }
+            
+            // Finally, add outliers (background elements for front-to-back rendering)
+            if (m_OthersIndices.Count > 0)
+            {
+                if (currentIndex + m_OthersIndices.Count > m_VisibleSplatIndices.Length)
+                {
+                    EnsureVisibleSplatIndicesCapacity(currentIndex + m_OthersIndices.Count);
+                    if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
+                    {
+                        visibleSplatCount = currentIndex;
+                        UpdateVisibleIndicesBuffer();
+                        return;
+                    }
+                }
+                
+                for (int i = 0; i < m_OthersIndices.Count; i++)
+                {
+                    m_VisibleSplatIndices[currentIndex + i] = m_OthersIndices[i];
+                }
+                currentIndex += m_OthersIndices.Count;
+            }
+            
             visibleSplatCount = currentIndex;
             UpdateVisibleIndicesBuffer();
         }
@@ -1076,7 +1078,7 @@ namespace GaussianSplatting.Runtime
                         scratch[i] = (0f, originalSplatIdx);
                     }
                 }
-                System.Array.Sort(scratch, 0, count, System.Collections.Generic.Comparer<(float distance, int index)>.Create((a, b) => b.distance.CompareTo(a.distance)));
+                System.Array.Sort(scratch, 0, count, System.Collections.Generic.Comparer<(float distance, int index)>.Create((a, b) => a.distance.CompareTo(b.distance))); // Front-to-back
                 for (int i = 0; i < count; i++)
                     splatIndices[i] = scratch[i].index;
             }
@@ -1199,7 +1201,7 @@ namespace GaussianSplatting.Runtime
                 {
                     seqTask = Task.Run(() =>
                     {
-                        // Process from back to front for visual priority (closer nodes processed first)
+                        // Process from front to back for front-to-back rendering (closer nodes processed first)
                         for (int i = sortNodeCount - 1; i >= 0; i--)
                         {
                             int nodeRefIndex = nodesToSort[i];
@@ -1226,11 +1228,11 @@ namespace GaussianSplatting.Runtime
             }
 
             // Work-stealing parallel sort implementation
-            // Shared work queue with thread-safe access - process from back to front for visual priority
+            // Shared work queue with thread-safe access - process from front to back for front-to-back rendering
             int nextWorkIndex = sortNodeCount - 1; // Start from the end (closest nodes)
             object workLock = new object();
 
-            // Get next work item (thread-safe) - process from back to front for visual priority
+            // Get next work item (thread-safe) - process from front to back for front-to-back rendering
             int GetNextWorkIndex()
             {
                 lock (workLock)
@@ -1617,7 +1619,7 @@ namespace GaussianSplatting.Runtime
                     m_DistanceSortArray[i] = (0f, originalSplatIdx);
                 }
             }
-            System.Array.Sort(m_DistanceSortArray, 0, count, System.Collections.Generic.Comparer<(float distance, int index)>.Create((a, b) => b.distance.CompareTo(a.distance)));
+            System.Array.Sort(m_DistanceSortArray, 0, count, System.Collections.Generic.Comparer<(float distance, int index)>.Create((a, b) => a.distance.CompareTo(b.distance))); // Front-to-back
             for (int i = 0; i < count; i++)
                 splatIndices[i] = m_DistanceSortArray[i].index;
         }

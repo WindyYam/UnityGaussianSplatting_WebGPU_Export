@@ -284,9 +284,9 @@ namespace GaussianSplatting.Runtime
                         break;
                     
                     case TransparencyMode.AlphaBlend:
-                        // Premultiplied alpha blending (shader does: i.col.rgb *= alpha)
-                        displayMat.SetInt(GaussianSplatRenderer.Props.SrcBlend, (int)BlendMode.One);
-                        displayMat.SetInt(GaussianSplatRenderer.Props.DstBlend, (int)BlendMode.OneMinusSrcAlpha);
+                        // Front-to-back alpha blending (shader does: i.col.rgb *= alpha)
+                        displayMat.SetInt(GaussianSplatRenderer.Props.SrcBlend, (int)BlendMode.OneMinusDstAlpha);
+                        displayMat.SetInt(GaussianSplatRenderer.Props.DstBlend, (int)BlendMode.One);
                         displayMat.SetInt(GaussianSplatRenderer.Props.ZWrite, 0);
                         break;
                 }

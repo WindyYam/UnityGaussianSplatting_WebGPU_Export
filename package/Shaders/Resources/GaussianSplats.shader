@@ -3,8 +3,8 @@ Shader "Gaussian Splatting/Render Splats"
 {
 	Properties
 	{
-		_SrcBlend("Src Blend", Float) = 1 // One
-		_DstBlend("Dst Blend", Float) = 8 // OneMinusDstAlpha
+		_SrcBlend("Src Blend", Float) = 7 // OneMinusDstAlpha
+		_DstBlend("Dst Blend", Float) = 1 // One
 		_ZWrite("ZWrite", Float) = 0  // Off
 	}
     SubShader
@@ -55,7 +55,7 @@ cbuffer SplatGlobalUniforms // match struct SplatGlobalUniforms in C#
 	uint sgu_transparencyMode;
 	uint sgu_frameOffset;
 	uint sgu_needMotionVectors; // Motion vector type, 0: None, 1: Simple(center), 2: Per vertex
-	uint sgu_padding0; // padding to align cbuffer to 16 bytes
+	float sgu_alphaThreshold; // Minimum alpha threshold for rendering
 }
 
 StructuredBuffer<uint> _SplatIndexMap; // optional mapping
@@ -270,13 +270,14 @@ FragOut frag (v2f i)
         if (alpha <= cutoff)
             discard;
         alpha = 1;
+        o.motion = half4(i.vel, 0, 0); // Use xy for motion vectors, zw unused for WebGPU compatibility
     }
     else // sgu_transparencyMode == 1 (AlphaBlend)
     {
         i.col.rgb *= alpha; // premultiply
         // This mode will require proper depth sorting for correct results
     }
-    o.motion = half4(i.vel, 0, 0); // Use xy for motion vectors, zw unused for WebGPU compatibility
+
     o.col = half4(i.col.rgb, alpha);
     return o;
 }
