@@ -44,12 +44,8 @@ namespace GaussianSplatting.Runtime
         }
 
         readonly List<OctreeNode> m_Nodes = new();
-        readonly List<SplatInfo> m_SplatInfos = new();
-        // Note: per-node splat indices are stored inside OctreeNode.splatIndices for leaf nodes.
         readonly List<int> m_VisibleSplatIndices = new();
-
-        // Dictionary to map original splat indices to their positions for efficient lookup during sorting
-        readonly Dictionary<int, float3> m_OriginalIndexToPosition = new();
+        int m_TotalSplats; // Persist total splat count after releasing build-time list
 
         // Configuration
         int m_MaxDepth;
@@ -115,10 +111,22 @@ namespace GaussianSplatting.Runtime
         }
 
         public int nodeCount => m_Nodes.Count;
-        public int totalSplats => m_SplatInfos.Count;
+        public int totalSplats => m_TotalSplats;
         public bool isBuilt => m_Built;
         public GraphicsBuffer visibleIndicesBuffer => m_VisibleIndicesBuffer;
         public int visibleSplatCount { get; private set; }
+
+        // Helper to get splat position directly from global native buffer
+        bool TryGetSplatPosition(int originalIndex, out float3 pos)
+        {
+            if (m_AllPositionsNativeValid && originalIndex >= 0 && originalIndex < m_AllPositionsNative.Length)
+            {
+                pos = m_AllPositionsNative[originalIndex];
+                return true;
+            }
+            pos = default;
+            return false;
+        }
 
         /// <summary>
         /// Initialize octree parameters. Call this before building.
@@ -144,9 +152,11 @@ namespace GaussianSplatting.Runtime
                 int nativeWorkers = Mathf.Max(1, envCores - 1); // Conservative worker count for all platforms
                 NativeSorting.Initialize(nativeWorkers);
 
-                if (NativeSorting.IsAvailable)
+                int nativeWorkerCount = NativeSorting.GetWorkerCount();
+                if (NativeSorting.IsAvailable && nativeWorkerCount > 0)
                 {
-                    parallelSortThreads = NativeSorting.GetWorkerCount();
+                    parallelSortThreads = nativeWorkerCount;
+
                     string platformName = isWebPlatform ? "WebGL" : "native";
                     Debug.Log($"GaussianSplatOctree: {platformName} platform — using native threading with {parallelSortThreads} workers");
                 }
@@ -187,13 +197,13 @@ namespace GaussianSplatting.Runtime
 
             // Compute center of mass and identify 95% closest splats
             int total = splatPositions.Length;
+            m_TotalSplats = total;
             float3 com = float3.zero;
             for (int i = 0; i < total; i++)
                 com += splatPositions[i];
             com /= total;
 
-            var distList = new List<(int idx, float d)>();
-            distList.Capacity = total;
+            var distList = new List<(int idx, float d)>(total);
             for (int i = 0; i < total; i++)
             {
                 float distance = math.distance(splatPositions[i], com);
@@ -206,20 +216,15 @@ namespace GaussianSplatting.Runtime
             inCount = Mathf.Clamp(inCount, 1, total);
             int othersCount = total - inCount;
 
-            m_SplatInfos.Clear();
-            m_SplatInfos.Capacity = total;
-
-            // Build lookup dictionary for original indices to positions
-            m_OriginalIndexToPosition.Clear();
+            // Local build-time splat info list
+            var splatInfos = new List<SplatInfo>(total);
             for (int i = 0; i < total; i++)
             {
                 int src = distList[i].idx;
-                var position = splatPositions[src];
-                m_SplatInfos.Add(new SplatInfo { position = position, originalIndex = src });
-                m_OriginalIndexToPosition[src] = position;
+                splatInfos.Add(new SplatInfo { position = splatPositions[src], originalIndex = src });
             }
 
-            // Create / update global native positions buffer (persistent for native sorting)
+            // Create / update global native positions buffer
             if (m_AllPositionsNativeValid)
             {
                 if (m_AllPositionsNative.IsCreated) m_AllPositionsNative.Dispose();
@@ -228,10 +233,9 @@ namespace GaussianSplatting.Runtime
             try
             {
                 m_AllPositionsNative = new NativeArray<float3>(total, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                // IMPORTANT: index by original splat index so native code can access positions via original index directly
-                for (int i = 0; i < m_SplatInfos.Count; i++)
+                for (int i = 0; i < splatInfos.Count; i++)
                 {
-                    var si = m_SplatInfos[i];
+                    var si = splatInfos[i];
                     int orig = si.originalIndex;
                     if ((uint)orig < (uint)total)
                         m_AllPositionsNative[orig] = si.position;
@@ -249,12 +253,12 @@ namespace GaussianSplatting.Runtime
             Bounds rootBounds;
             if (inCount > 0)
             {
-                float3 min = m_SplatInfos[0].position;
-                float3 max = m_SplatInfos[0].position;
+                float3 min = splatInfos[0].position;
+                float3 max = splatInfos[0].position;
                 for (int i = 1; i < inCount; i++)
                 {
-                    min = math.min(min, m_SplatInfos[i].position);
-                    max = math.max(max, m_SplatInfos[i].position);
+                    min = math.min(min, splatInfos[i].position);
+                    max = math.max(max, splatInfos[i].position);
                 }
                 rootBounds = new Bounds((max + min) * 0.5f, max - min);
             }
@@ -283,8 +287,8 @@ namespace GaussianSplatting.Runtime
 
             // Build recursively starting from root (only for the in-root partition)
             var rootSplatList = new List<int>(inCount);
-            for (int i = 0; i < inCount; i++) rootSplatList.Add(i); // indices into m_SplatInfos
-            BuildRecursive(0, 0, rootSplatList);
+            for (int i = 0; i < inCount; i++) rootSplatList.Add(i); // indices into splatInfos
+            BuildRecursive(0, 0, rootSplatList, splatInfos);
 
             // Handle remaining outliers: put their original indices into m_SplatIndices and track them in m_OthersIndices
             m_OthersIndices.Clear();
@@ -292,7 +296,7 @@ namespace GaussianSplatting.Runtime
             {
                 for (int i = 0; i < othersCount; i++)
                 {
-                    int orig = m_SplatInfos[inCount + i].originalIndex;
+                    int orig = splatInfos[inCount + i].originalIndex;
                     m_OthersIndices.Add(orig);
                 }
             }
@@ -300,15 +304,16 @@ namespace GaussianSplatting.Runtime
             m_LastOthersSortCamPos = Vector3.zero;
             // Compute average outlier ring radius (ignore min/max & extra stats for simplicity)
             m_OutlierRingRadius = 0f;
-            if (othersCount > 0)
+            if (othersCount > 0 && m_AllPositionsNativeValid)
             {
                 Vector3 center = m_RootBounds.center;
                 double accum = 0.0;
                 for (int i = 0; i < othersCount; i++)
                 {
-                    int orig = m_SplatInfos[inCount + i].originalIndex;
-                    if (m_OriginalIndexToPosition.TryGetValue(orig, out float3 p))
+                    int orig = splatInfos[inCount + i].originalIndex;
+                    if (orig >= 0 && orig < m_AllPositionsNative.Length)
                     {
+                        float3 p = m_AllPositionsNative[orig];
                         accum += Vector3.Distance(center, (Vector3)p);
                     }
                 }
@@ -338,7 +343,7 @@ namespace GaussianSplatting.Runtime
             Debug.Log($"Octree build completed: {m_Nodes.Count} total nodes, others={m_OthersIndices.Count}");
         }
 
-        void BuildRecursive(int nodeIndex, int depth, List<int> splatList)
+        void BuildRecursive(int nodeIndex, int depth, List<int> splatList, List<SplatInfo> splatInfos)
         {
             var node = m_Nodes[nodeIndex];
 
@@ -351,12 +356,12 @@ namespace GaussianSplatting.Runtime
                 for (int i = 0; i < splatList.Count; i++)
                 {
                     int infoIdx = splatList[i];
-                    if (infoIdx < 0 || infoIdx >= m_SplatInfos.Count)
+                    if (infoIdx < 0 || infoIdx >= splatInfos.Count)
                     {
-                        Debug.LogError($"Octree leaf node splat info index out of bounds: {infoIdx} >= {m_SplatInfos.Count}");
+                        Debug.LogError($"Octree leaf node splat info index out of bounds: {infoIdx} >= {splatInfos.Count}");
                         continue;
                     }
-                    node.splatIndices.Add(m_SplatInfos[infoIdx].originalIndex);
+                    node.splatIndices.Add(splatInfos[infoIdx].originalIndex);
                 }
 
                 m_Nodes[nodeIndex] = node;
@@ -391,13 +396,13 @@ namespace GaussianSplatting.Runtime
             for (int ii = 0; ii < splatList.Count; ii++)
             {
                 int infoIdx = splatList[ii];
-                if (infoIdx < 0 || infoIdx >= m_SplatInfos.Count)
+                if (infoIdx < 0 || infoIdx >= splatInfos.Count)
                 {
-                    Debug.LogError($"Octree splat distribution info index out of bounds: {infoIdx} >= {m_SplatInfos.Count}");
+                    Debug.LogError($"Octree splat distribution info index out of bounds: {infoIdx} >= {splatInfos.Count}");
                     continue;
                 }
 
-                var splat = m_SplatInfos[infoIdx];
+                var splat = splatInfos[infoIdx];
 
                 int childIndex = 0;
                 if (splat.position.x > center.x) childIndex |= 1;
@@ -431,7 +436,7 @@ namespace GaussianSplatting.Runtime
                 // Recursively build child only if it has splats
                 if (childSplatsIdx[i].Count > 0)
                 {
-                    BuildRecursive(childNodeIndex, depth + 1, childSplatsIdx[i]);
+                    BuildRecursive(childNodeIndex, depth + 1, childSplatsIdx[i], splatInfos);
                 }
             }
         }
@@ -471,48 +476,35 @@ namespace GaussianSplatting.Runtime
 
             if (node.isLeaf)
             {
-                // For leaf nodes, calculate tight bounds based on actual splat positions
                 if (node.splatIndices != null && node.splatIndices.Count > 0)
                 {
-                    // Get first splat position to initialize bounds
                     int firstSplatIdx = node.splatIndices[0];
-                    if (m_OriginalIndexToPosition.TryGetValue(firstSplatIdx, out float3 firstPos))
+                    if (TryGetSplatPosition(firstSplatIdx, out float3 firstPos))
                     {
                         float3 min = firstPos;
                         float3 max = firstPos;
-
-                        // Expand bounds to include all splats in this leaf
                         for (int i = 1; i < node.splatIndices.Count; i++)
                         {
                             int splatIdx = node.splatIndices[i];
-                            if (m_OriginalIndexToPosition.TryGetValue(splatIdx, out float3 pos))
+                            if (TryGetSplatPosition(splatIdx, out float3 pos))
                             {
                                 min = math.min(min, pos);
                                 max = math.max(max, pos);
                             }
                         }
-
-                        // Update node bounds with tight fit
                         Vector3 center = (Vector3)((min + max) * 0.5f);
                         Vector3 size = (Vector3)(max - min);
-                        
-                        // Ensure minimum size to avoid zero-size bounds
                         const float minSize = 0.001f;
                         size.x = Mathf.Max(size.x, minSize);
                         size.y = Mathf.Max(size.y, minSize);
                         size.z = Mathf.Max(size.z, minSize);
-
                         node.bounds = new Bounds(center, size);
                         node.maxExtent = Mathf.Max(size.x, Mathf.Max(size.y, size.z)) * 0.5f;
-
-                        // Update the node in the list
                         m_Nodes[nodeIndex] = node;
-                        
-                        // Check if bounds actually changed
                         return !BoundsAreEqual(originalBounds, node.bounds);
                     }
                 }
-                return false; // No splats, bounds unchanged
+                return false;
             }
             else
             {
@@ -615,10 +607,6 @@ namespace GaussianSplatting.Runtime
             }
 
             visibleSplatCount = m_VisibleSplatIndices.Count;
-
-            // Debug log culling performance
-            //float cullingRatio = (float)visibleSplatCount / Mathf.Max(1, m_SplatInfos.Count);
-            //Debug.Log($"Octree culling: {visibleSplatCount}/{m_SplatInfos.Count} splats visible ({cullingRatio:P1})");
 
             // Update GPU buffer
             UpdateVisibleIndicesBuffer();
@@ -772,10 +760,8 @@ namespace GaussianSplatting.Runtime
             CleanupNativeSortJobs();
             
             m_Nodes.Clear();
-            m_SplatInfos.Clear();
             m_VisibleSplatIndices.Clear();
             m_VisibleNodeRefs.Clear();
-            m_OriginalIndexToPosition.Clear();
             m_VisibleIndicesBuffer?.Dispose();
             m_VisibleIndicesBuffer = null;
             m_DistanceSortArray = null; // Release sort array memory
@@ -791,6 +777,8 @@ namespace GaussianSplatting.Runtime
                 m_AllPositionsNative.Dispose();
                 m_AllPositionsNativeValid = false;
             }
+
+            m_TotalSplats = 0;
         }
 
         public void Dispose()
@@ -931,7 +919,7 @@ namespace GaussianSplatting.Runtime
                 for (int i = 0; i < count; i++)
                 {
                     int originalSplatIdx = splatIndices[i];
-                    if (m_OriginalIndexToPosition.TryGetValue(originalSplatIdx, out float3 splatPos))
+                    if (TryGetSplatPosition(originalSplatIdx, out float3 splatPos))
                     {
                         float distance = ((Vector3)splatPos - camPosition).sqrMagnitude;
                         scratch[i] = (distance, originalSplatIdx);
@@ -1447,7 +1435,7 @@ namespace GaussianSplatting.Runtime
             for (int i = 0; i < count; i++)
             {
                 int originalSplatIdx = splatIndices[i];
-                if (m_OriginalIndexToPosition.TryGetValue(originalSplatIdx, out float3 splatPos))
+                if (TryGetSplatPosition(originalSplatIdx, out float3 splatPos))
                 {
                     float distance = ((Vector3)splatPos - camPosition).sqrMagnitude;
                     m_DistanceSortArray[i] = (distance, originalSplatIdx);
