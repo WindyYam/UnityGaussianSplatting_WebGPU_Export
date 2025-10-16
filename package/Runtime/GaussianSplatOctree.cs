@@ -374,6 +374,8 @@ namespace GaussianSplatting.Runtime
             }
 
             Debug.Log($"Octree build completed: {m_Nodes.Count} total nodes, others={m_OthersIndices.Count}");
+
+            EnsureVisibleSplatIndicesCapacity(m_TotalSplats);
         }
 
         void BuildRecursive(int nodeIndex, int depth, List<int> splatList, List<SplatInfo> splatInfos)
@@ -626,7 +628,6 @@ namespace GaussianSplatting.Runtime
 
             // Estimate capacity needed (total splats as upper bound)
             int estimatedCapacity = m_TotalSplats;
-            EnsureVisibleSplatIndicesCapacity(estimatedCapacity);
 
             if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
             {
@@ -647,7 +648,6 @@ namespace GaussianSplatting.Runtime
                 // Ensure we have enough space for outliers
                 if (currentIndex + m_OthersIndices.Count > m_VisibleSplatIndices.Length)
                 {
-                    EnsureVisibleSplatIndicesCapacity(currentIndex + m_OthersIndices.Count);
                     if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
                     {
                         visibleSplatCount = 0;
@@ -690,7 +690,6 @@ namespace GaussianSplatting.Runtime
                     // Ensure we have enough space
                     if (currentIndex + node.splatIndices.Count > m_VisibleSplatIndices.Length)
                     {
-                        EnsureVisibleSplatIndicesCapacity(currentIndex + node.splatIndices.Count);
                         if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
                             return;
                     }
@@ -925,10 +924,6 @@ namespace GaussianSplatting.Runtime
                 return;
             var camPosition = camera.transform.position;
             
-            // Estimate capacity and ensure native array is ready
-            int estimatedCapacity = m_TotalSplats;
-            EnsureVisibleSplatIndicesCapacity(estimatedCapacity);
-            
             if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
             {
                 visibleSplatCount = 0;
@@ -1014,7 +1009,7 @@ namespace GaussianSplatting.Runtime
             {
                 if (currentIndex + m_OthersIndices.Count > m_VisibleSplatIndices.Length)
                 {
-                    EnsureVisibleSplatIndicesCapacity(currentIndex + m_OthersIndices.Count);
+
                     if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
                     {
                         visibleSplatCount = 0;
@@ -1039,7 +1034,6 @@ namespace GaussianSplatting.Runtime
                     // Ensure we have enough space
                     if (currentIndex + node.splatIndices.Count > m_VisibleSplatIndices.Length)
                     {
-                        EnsureVisibleSplatIndicesCapacity(currentIndex + node.splatIndices.Count);
                         if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
                         {
                             visibleSplatCount = currentIndex;
