@@ -98,18 +98,20 @@ namespace GaussianSplatting.Runtime
         
         // Native sorting job handles for WebGL platform
         readonly List<NativeSorting.SortJobHandle> m_NativeSortJobs = new();
-        readonly List<NativeArray<int>> m_NativeSortBuffers = new();
-        readonly List<NativeArray<float3>> m_NativePositionBuffers = new();
-        readonly List<NativeArray<int>> m_NativeSortedBuffers = new();
         // Track which jobs correspond to which data structures
         readonly List<NativeSortJobInfo> m_NativeJobInfos = new();
+
+        // Global native positions buffer (all splat positions) to avoid per-job copying
+        NativeArray<float3> m_AllPositionsNative;
+        bool m_AllPositionsNativeValid;
         
         struct NativeSortJobInfo
         {
             public bool isOutlierJob;
             public int nodeIndex; // -1 for outlier jobs
-            public List<int> originalIndices; // Store original indices to map results back
-            public Vector3 cameraPosition; // Store camera position when job was started
+            public Vector3 cameraPosition;
+            public NativeArray<int> inputIndices; // Per-job input splat indices
+            public NativeArray<int> sortedIndices; // Per-job output sorted indices
         }
 
         public int nodeCount => m_Nodes.Count;
@@ -136,29 +138,32 @@ namespace GaussianSplatting.Runtime
             // Check if native threading is supported on current platform
             bool isWebPlatform = Application.platform == RuntimePlatform.WebGLPlayer;
             
-            // Try to initialize native sorting for supported platforms
-            int nativeWorkers = Mathf.Max(1, envCores - 1); // Conservative worker count for all platforms
-            NativeSorting.Initialize(nativeWorkers);
+            if(enableParallelSorting) 
+            {
+                // Try to initialize native sorting for supported platforms
+                int nativeWorkers = Mathf.Max(1, envCores - 1); // Conservative worker count for all platforms
+                NativeSorting.Initialize(nativeWorkers);
+
+                if (NativeSorting.IsAvailable)
+                {
+                    parallelSortThreads = NativeSorting.GetWorkerCount();
+                    string platformName = isWebPlatform ? "WebGL" : "native";
+                    Debug.Log($"GaussianSplatOctree: {platformName} platform — using native threading with {parallelSortThreads} workers");
+                }
+                else if (isWebPlatform)
+                {
+                    // WebGL without native support - fallback to sequential
+                    enableParallelSorting = false;
+                    Debug.LogWarning("GaussianSplatOctree: WebGL platform — native threading unavailable, using single-threaded fallback.");
+                }
+                else
+                {
+                    int reportedCores = SystemInfo.processorCount;
+                    if (reportedCores > 0)
+                        parallelSortThreads = reportedCores;
+                }
+            }
             
-            if (NativeSorting.IsAvailable)
-            {
-                enableParallelSorting = true;
-                parallelSortThreads = NativeSorting.GetWorkerCount();
-                string platformName = isWebPlatform ? "WebGL" : "native";
-                Debug.Log($"GaussianSplatOctree: {platformName} platform — using native threading with {parallelSortThreads} workers");
-            }
-            else if (isWebPlatform)
-            {
-                // WebGL without native support - fallback to sequential
-                enableParallelSorting = false;
-                Debug.LogWarning("GaussianSplatOctree: WebGL platform — native threading unavailable, using single-threaded fallback.");
-            }
-            else
-            {
-                int reportedCores = SystemInfo.processorCount;
-                if (reportedCores > 0)
-                    parallelSortThreads = reportedCores;
-            }
             if(enableParallelSorting)
                 // Inform about the number of threads that will be used for parallel sorting
                 Debug.Log($"GaussianSplatOctree: parallelSortThreads set to {parallelSortThreads}");
@@ -212,6 +217,32 @@ namespace GaussianSplatting.Runtime
                 var position = splatPositions[src];
                 m_SplatInfos.Add(new SplatInfo { position = position, originalIndex = src });
                 m_OriginalIndexToPosition[src] = position;
+            }
+
+            // Create / update global native positions buffer (persistent for native sorting)
+            if (m_AllPositionsNativeValid)
+            {
+                if (m_AllPositionsNative.IsCreated) m_AllPositionsNative.Dispose();
+                m_AllPositionsNativeValid = false;
+            }
+            try
+            {
+                m_AllPositionsNative = new NativeArray<float3>(total, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                // IMPORTANT: index by original splat index so native code can access positions via original index directly
+                for (int i = 0; i < m_SplatInfos.Count; i++)
+                {
+                    var si = m_SplatInfos[i];
+                    int orig = si.originalIndex;
+                    if ((uint)orig < (uint)total)
+                        m_AllPositionsNative[orig] = si.position;
+                }
+                m_AllPositionsNativeValid = true;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"Failed to allocate global native positions buffer: {ex.Message}");
+                if (m_AllPositionsNative.IsCreated) m_AllPositionsNative.Dispose();
+                m_AllPositionsNativeValid = false;
             }
 
             // Create root bounds based on the inCount splats (centered on center-of-mass)
@@ -754,6 +785,12 @@ namespace GaussianSplatting.Runtime
             m_OthersSorted = false;
             m_LastOthersSortCamPos = Vector3.zero;
             m_OutlierRingRadius = 0f;
+
+            if (m_AllPositionsNativeValid && m_AllPositionsNative.IsCreated)
+            {
+                m_AllPositionsNative.Dispose();
+                m_AllPositionsNativeValid = false;
+            }
         }
 
         public void Dispose()
@@ -769,45 +806,23 @@ namespace GaussianSplatting.Runtime
         
         void CleanupNativeSortJobs()
         {
-            // Cleanup any pending native sort jobs
-            for (int i = 0; i < m_NativeSortJobs.Count; i++)
+            for (int i = m_NativeSortJobs.Count - 1; i >= 0; i--)
             {
-                if (m_NativeSortJobs[i].IsValid)
+                var handle = m_NativeSortJobs[i];
+                if (handle.IsValid)
                 {
-                    NativeSorting.CleanupJob(m_NativeSortJobs[i]);
+                    try { NativeSorting.CleanupJob(handle); } catch { }
                 }
-            }
-            m_NativeSortJobs.Clear();
-            
-            // Dispose native arrays
-            for (int i = 0; i < m_NativeSortBuffers.Count; i++)
-            {
-                if (m_NativeSortBuffers[i].IsCreated)
+                // Dispose embedded buffers
+                try
                 {
-                    m_NativeSortBuffers[i].Dispose();
+                    if (m_NativeJobInfos[i].inputIndices.IsCreated) m_NativeJobInfos[i].inputIndices.Dispose();
+                    if (m_NativeJobInfos[i].sortedIndices.IsCreated) m_NativeJobInfos[i].sortedIndices.Dispose();
                 }
+                catch { }
+                m_NativeSortJobs.RemoveAt(i);
+                m_NativeJobInfos.RemoveAt(i);
             }
-            m_NativeSortBuffers.Clear();
-            
-            for (int i = 0; i < m_NativePositionBuffers.Count; i++)
-            {
-                if (m_NativePositionBuffers[i].IsCreated)
-                {
-                    m_NativePositionBuffers[i].Dispose();
-                }
-            }
-            m_NativePositionBuffers.Clear();
-            
-            for (int i = 0; i < m_NativeSortedBuffers.Count; i++)
-            {
-                if (m_NativeSortedBuffers[i].IsCreated)
-                {
-                    m_NativeSortedBuffers[i].Dispose();
-                }
-            }
-            m_NativeSortedBuffers.Clear();
-            
-            m_NativeJobInfos.Clear();
         }
 
         /// <summary>
@@ -1221,61 +1236,30 @@ namespace GaussianSplatting.Runtime
         /// <returns>True if job was started successfully</returns>
         bool StartNativeOutlierSort(Vector3 camPosition)
         {
-            if (m_OthersIndices.Count <= 1)
-                return false;
-
+            if (m_OthersIndices.Count <= 1) return false;
+            if (!m_AllPositionsNativeValid) return false;
             try
             {
-                // Create native arrays for direct native access
-                var splatBuffer = new NativeArray<int>(m_OthersIndices.Count, Allocator.Persistent);
-                var positionBuffer = new NativeArray<float3>(m_OthersIndices.Count, Allocator.Persistent);
-                var sortedBuffer = new NativeArray<int>(m_OthersIndices.Count, Allocator.Persistent);
-
-                // Copy splat indices and their corresponding positions
-                for (int i = 0; i < m_OthersIndices.Count; i++)
+                var input = new NativeArray<int>(m_OthersIndices.Count, Allocator.Persistent);
+                var output = new NativeArray<int>(m_OthersIndices.Count, Allocator.Persistent);
+                for (int i = 0; i < m_OthersIndices.Count; i++) input[i] = m_OthersIndices[i];
+                var handle = NativeSorting.StartSortJob(input, m_AllPositionsNative, output, camPosition);
+                if (!handle.IsValid)
                 {
-                    int originalIndex = m_OthersIndices[i];
-                    splatBuffer[i] = i; // Use array index as the reference
-                    
-                    // Get position for this original index
-                    if (m_OriginalIndexToPosition.TryGetValue(originalIndex, out float3 position))
-                    {
-                        positionBuffer[i] = position;
-                    }
-                    else
-                    {
-                        positionBuffer[i] = float3.zero; // Fallback for missing positions
-                    }
-                }
-
-                // Start native sort job - results written directly to sortedBuffer
-                var jobHandle = NativeSorting.StartSortJob(splatBuffer, positionBuffer, sortedBuffer, camPosition);
-                
-                if (jobHandle.IsValid)
-                {
-                    m_NativeSortJobs.Add(jobHandle);
-                    m_NativeSortBuffers.Add(splatBuffer);
-                    m_NativePositionBuffers.Add(positionBuffer);
-                    m_NativeSortedBuffers.Add(sortedBuffer);
-                    
-                    // Track job info for result mapping
-                    var jobInfo = new NativeSortJobInfo
-                    {
-                        isOutlierJob = true,
-                        nodeIndex = -1,
-                        originalIndices = new List<int>(m_OthersIndices), // Copy current outlier indices
-                        cameraPosition = camPosition
-                    };
-                    m_NativeJobInfos.Add(jobInfo);
-                    return true;
-                }
-                else
-                {
-                    splatBuffer.Dispose();
-                    positionBuffer.Dispose();
-                    sortedBuffer.Dispose();
+                    input.Dispose();
+                    output.Dispose();
                     return false;
                 }
+                m_NativeSortJobs.Add(handle);
+                m_NativeJobInfos.Add(new NativeSortJobInfo
+                {
+                    isOutlierJob = true,
+                    nodeIndex = -1,
+                    cameraPosition = camPosition,
+                    inputIndices = input,
+                    sortedIndices = output
+                });
+                return true;
             }
             catch (Exception ex)
             {
@@ -1290,69 +1274,36 @@ namespace GaussianSplatting.Runtime
         /// <returns>True if job was started successfully</returns>
         bool StartNativeNodeSort(int nodeIndex, Vector3 camPosition)
         {
-            if (nodeIndex < 0 || nodeIndex >= m_Nodes.Count)
-                return false;
-
+            if (nodeIndex < 0 || nodeIndex >= m_Nodes.Count) return false;
             var node = m_Nodes[nodeIndex];
-            if (node.splatIndices == null || node.splatIndices.Count <= 1)
-                return false;
-
+            if (node.splatIndices == null || node.splatIndices.Count <= 1) return false;
+            if (!m_AllPositionsNativeValid) return false;
             try
             {
-                // Create native arrays for direct native access
-                var splatBuffer = new NativeArray<int>(node.splatIndices.Count, Allocator.Persistent);
-                var positionBuffer = new NativeArray<float3>(node.splatIndices.Count, Allocator.Persistent);
-                var sortedBuffer = new NativeArray<int>(node.splatIndices.Count, Allocator.Persistent);
-
-                // Copy splat indices and their corresponding positions
-                for (int i = 0; i < node.splatIndices.Count; i++)
+                var input = new NativeArray<int>(node.splatIndices.Count, Allocator.Persistent);
+                var output = new NativeArray<int>(node.splatIndices.Count, Allocator.Persistent);
+                for (int i = 0; i < node.splatIndices.Count; i++) input[i] = node.splatIndices[i];
+                var handle = NativeSorting.StartSortJob(input, m_AllPositionsNative, output, camPosition);
+                if (!handle.IsValid)
                 {
-                    int originalIndex = node.splatIndices[i];
-                    splatBuffer[i] = i; // Use array index as the reference
-                    
-                    // Get position for this original index
-                    if (m_OriginalIndexToPosition.TryGetValue(originalIndex, out float3 position))
-                    {
-                        positionBuffer[i] = position;
-                    }
-                    else
-                    {
-                        positionBuffer[i] = float3.zero; // Fallback for missing positions
-                    }
-                }
-
-                // Start native sort job - results written directly to sortedBuffer
-                var jobHandle = NativeSorting.StartSortJob(splatBuffer, positionBuffer, sortedBuffer, camPosition);
-                
-                if (jobHandle.IsValid)
-                {
-                    m_NativeSortJobs.Add(jobHandle);
-                    m_NativeSortBuffers.Add(splatBuffer);
-                    m_NativePositionBuffers.Add(positionBuffer);
-                    m_NativeSortedBuffers.Add(sortedBuffer);
-                    
-                    // Track job info for result mapping
-                    var jobInfo = new NativeSortJobInfo
-                    {
-                        isOutlierJob = false,
-                        nodeIndex = nodeIndex,
-                        originalIndices = new List<int>(node.splatIndices), // Copy current node indices
-                        cameraPosition = camPosition
-                    };
-                    m_NativeJobInfos.Add(jobInfo);
-                    return true;
-                }
-                else
-                {
-                    splatBuffer.Dispose();
-                    positionBuffer.Dispose();
-                    sortedBuffer.Dispose();
+                    input.Dispose();
+                    output.Dispose();
                     return false;
                 }
+                m_NativeSortJobs.Add(handle);
+                m_NativeJobInfos.Add(new NativeSortJobInfo
+                {
+                    isOutlierJob = false,
+                    nodeIndex = nodeIndex,
+                    cameraPosition = camPosition,
+                    inputIndices = input,
+                    sortedIndices = output
+                });
+                return true;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Failed to start native node sort job for node {nodeIndex}: {ex.Message}");
+                Debug.LogError($"Failed to start native sort job for node {nodeIndex}: {ex.Message}");
                 return false;
             }
         }
@@ -1365,145 +1316,62 @@ namespace GaussianSplatting.Runtime
         {
             for (int i = m_NativeSortJobs.Count - 1; i >= 0; i--)
             {
-                var jobHandle = m_NativeSortJobs[i];
-                if (jobHandle.IsCompleted)
+                var handle = m_NativeSortJobs[i];
+                if (!handle.IsCompleted) continue;
+                var info = m_NativeJobInfos[i];
+                try
                 {
-                    try
-                    {
-                        var jobInfo = m_NativeJobInfos[i];
-                        var sortedIndices = m_NativeSortedBuffers[i];
-                        
-                        // Results are already in the sortedIndices buffer - no need to copy
-                        // Apply results back to the appropriate data structure
-                        if (jobInfo.isOutlierJob)
-                        {
-                            // Update outlier indices with sorted results
-                            ApplySortedOutlierResults(sortedIndices, jobInfo.originalIndices, jobInfo.cameraPosition);
-                        }
-                        else
-                        {
-                            // Update node indices with sorted results
-                            ApplySortedNodeResults(jobInfo.nodeIndex, sortedIndices, jobInfo.originalIndices, jobInfo.cameraPosition);
-                        }
-                        
-                        //Debug.Log($"Applied native sort results for {(jobInfo.isOutlierJob ? "outliers" : $"node {jobInfo.nodeIndex}")} with {sortedIndices.Length} indices");
-                        
-                        // Cleanup job
-                        NativeSorting.CleanupJob(jobHandle);
-                        m_NativeSortBuffers[i].Dispose();
-                        m_NativePositionBuffers[i].Dispose();
-                        m_NativeSortedBuffers[i].Dispose();
-                        
-                        // Remove from tracking lists
-                        m_NativeSortJobs.RemoveAt(i);
-                        m_NativeSortBuffers.RemoveAt(i);
-                        m_NativePositionBuffers.RemoveAt(i);
-                        m_NativeSortedBuffers.RemoveAt(i);
-                        m_NativeJobInfos.RemoveAt(i);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.LogError($"Error collecting native sort results: {ex.Message}");
-                        
-                        // Still cleanup on error
-                        try
-                        {
-                            NativeSorting.CleanupJob(jobHandle);
-                            m_NativeSortBuffers[i].Dispose();
-                            m_NativePositionBuffers[i].Dispose();
-                            m_NativeSortedBuffers[i].Dispose();
-                            m_NativeSortJobs.RemoveAt(i);
-                            m_NativeSortBuffers.RemoveAt(i);
-                            m_NativePositionBuffers.RemoveAt(i);
-                            m_NativeSortedBuffers.RemoveAt(i);
-                            m_NativeJobInfos.RemoveAt(i);
-                        }
-                        catch { /* Ignore cleanup errors */ }
-                    }
+                    if (info.isOutlierJob)
+                        ApplySortedOutlierResults(info.sortedIndices, info.cameraPosition);
+                    else
+                        ApplySortedNodeResults(info.nodeIndex, info.sortedIndices, info.cameraPosition);
+                    try { NativeSorting.CleanupJob(handle); } catch { }
                 }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"Error collecting native sort results: {ex.Message}");
+                }
+                try { if (info.inputIndices.IsCreated) info.inputIndices.Dispose(); } catch { }
+                try { if (info.sortedIndices.IsCreated) info.sortedIndices.Dispose(); } catch { }
+                m_NativeSortJobs.RemoveAt(i);
+                m_NativeJobInfos.RemoveAt(i);
             }
-            
-            // Return true if no jobs are running (all completed)
             return m_NativeSortJobs.Count == 0;
         }
         
         /// <summary>
         /// Apply sorted results to outlier indices.
         /// </summary>
-        void ApplySortedOutlierResults(NativeArray<int> sortedIndices, List<int> originalIndices, Vector3 camPosition)
+        void ApplySortedOutlierResults(NativeArray<int> sortedIndices, Vector3 camPosition)
         {
-            if (sortedIndices.Length != originalIndices.Count)
-            {
-                Debug.LogWarning($"Native sort result count mismatch for outliers: {sortedIndices.Length} vs {originalIndices.Count}");
-                return;
-            }
-            
-            // Map sorted array indices back to original splat indices
             m_OthersIndices.Clear();
             for (int i = 0; i < sortedIndices.Length; i++)
-            {
-                int sortedArrayIndex = sortedIndices[i];
-                if (sortedArrayIndex >= 0 && sortedArrayIndex < originalIndices.Count)
-                {
-                    m_OthersIndices.Add(originalIndices[sortedArrayIndex]);
-                }
-                else
-                {
-                    Debug.LogWarning($"Invalid sorted index for outliers: {sortedArrayIndex}");
-                    m_OthersIndices.Add(originalIndices[i]); // Fallback to original order
-                }
-            }
-            
+                m_OthersIndices.Add(sortedIndices[i]);
             m_OthersSorted = true;
             m_LastOthersSortCamPos = camPosition;
-            //Debug.Log($"Applied native sort to {m_OthersIndices.Count} outlier indices");
         }
         
         /// <summary>
         /// Apply sorted results to node indices.
         /// </summary>
-        void ApplySortedNodeResults(int nodeIndex, NativeArray<int> sortedIndices, List<int> originalIndices, Vector3 camPosition)
+        void ApplySortedNodeResults(int nodeIndex, NativeArray<int> sortedIndices, Vector3 camPosition)
         {
             if (nodeIndex < 0 || nodeIndex >= m_Nodes.Count)
             {
                 Debug.LogWarning($"Invalid node index for native sort results: {nodeIndex}");
                 return;
             }
-            
             var node = m_Nodes[nodeIndex];
             if (node.splatIndices == null)
             {
                 Debug.LogWarning($"Node {nodeIndex} has null splat indices");
                 return;
             }
-            
-            if (sortedIndices.Length != originalIndices.Count)
-            {
-                Debug.LogWarning($"Native sort result count mismatch for node {nodeIndex}: {sortedIndices.Length} vs {originalIndices.Count}");
-                return;
-            }
-            
-            // Map sorted array indices back to original splat indices
             node.splatIndices.Clear();
             for (int i = 0; i < sortedIndices.Length; i++)
-            {
-                int sortedArrayIndex = sortedIndices[i];
-                if (sortedArrayIndex >= 0 && sortedArrayIndex < originalIndices.Count)
-                {
-                    node.splatIndices.Add(originalIndices[sortedArrayIndex]);
-                }
-                else
-                {
-                    Debug.LogWarning($"Invalid sorted index for node {nodeIndex}: {sortedArrayIndex}");
-                    node.splatIndices.Add(originalIndices[i]); // Fallback to original order
-                }
-            }
-            
-            // Mark node as sorted and update camera position
+                node.splatIndices.Add(sortedIndices[i]);
             node.isSorted = true;
             node.lastSortCameraPosition = camPosition;
-            
-            ///Debug.Log($"Applied native sort to node {nodeIndex} with {node.splatIndices.Count} indices");
         }
 
         /// <summary>
@@ -1513,27 +1381,14 @@ namespace GaussianSplatting.Runtime
         {
             for (int i = m_NativeSortJobs.Count - 1; i >= 0; i--)
             {
-                var jobHandle = m_NativeSortJobs[i];
-                if (jobHandle.IsCompleted)
-                {
-                    try
-                    {
-                        NativeSorting.CleanupJob(jobHandle);
-                        m_NativeSortBuffers[i].Dispose();
-                        m_NativePositionBuffers[i].Dispose();
-                        m_NativeSortedBuffers[i].Dispose();
-                        
-                        m_NativeSortJobs.RemoveAt(i);
-                        m_NativeSortBuffers.RemoveAt(i);
-                        m_NativePositionBuffers.RemoveAt(i);
-                        m_NativeSortedBuffers.RemoveAt(i);
-                        m_NativeJobInfos.RemoveAt(i);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.LogError($"Error cleaning up completed native job: {ex.Message}");
-                    }
-                }
+                var handle = m_NativeSortJobs[i];
+                if (!handle.IsCompleted) continue;
+                try { NativeSorting.CleanupJob(handle); } catch { }
+                var info = m_NativeJobInfos[i];
+                try { if (info.inputIndices.IsCreated) info.inputIndices.Dispose(); } catch { }
+                try { if (info.sortedIndices.IsCreated) info.sortedIndices.Dispose(); } catch { }
+                m_NativeSortJobs.RemoveAt(i);
+                m_NativeJobInfos.RemoveAt(i);
             }
         }
 
