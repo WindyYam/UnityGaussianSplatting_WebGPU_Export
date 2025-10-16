@@ -11,8 +11,8 @@
 #include <time.h>
 
 // Maximum number of concurrent sort jobs
-#define MAX_SORT_JOBS 128
-#define MAX_WORKERS 8
+#define MAX_SORT_JOBS 256
+#define MAX_WORKERS 16
 
 #define true 1
 #define false 0
