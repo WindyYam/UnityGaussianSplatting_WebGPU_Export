@@ -57,7 +57,7 @@ namespace GaussianSplatting.Runtime
                     RenderTextureDescriptor rtDesc = cameraData.cameraTargetDescriptor;
                     rtDesc.depthBufferBits = 0;
                     rtDesc.msaaSamples = 1;
-                    rtDesc.graphicsFormat = GraphicsFormat.R8G8B8A8_UNorm;
+                    rtDesc.graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat;
 
                     var colorHandle = UniversalRenderer.CreateRenderGraphTexture(renderGraph, rtDesc, GaussianSplatRTName, true);
                     passData.GaussianSplatRT = colorHandle;
@@ -69,7 +69,7 @@ namespace GaussianSplatting.Runtime
                     var motionDesc = cameraData.cameraTargetDescriptor;
                     motionDesc.depthBufferBits = 0;
                     motionDesc.msaaSamples = 1;
-                    motionDesc.graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat;
+                    motionDesc.graphicsFormat = GraphicsFormat.R8G8B8A8_UNorm;
                     var motionHandle = UniversalRenderer.CreateRenderGraphTexture(renderGraph, motionDesc, GaussianMotionRTName, true);
                     passData.GaussianSplatMotionRT = motionHandle;
                     builder.UseTexture(motionHandle, AccessFlags.Write);
@@ -100,7 +100,20 @@ namespace GaussianSplatting.Runtime
                         commandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.GaussianSplatRT, data.GaussianSplatRT);
                         commandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.GaussianSplatMotionRT, data.GaussianSplatMotionRT);
                         // render to both color and motion RTs
-                        CoreUtils.SetRenderTarget(commandBuffer, new RenderTargetIdentifier[] { data.GaussianSplatRT, data.GaussianSplatMotionRT }, data.SourceDepth, ClearFlag.None);
+                        var needsMotionVectors = settings.m_TemporalFilter != TemporalFilter.None; // Only for alpha cutout
+
+                        if (needsMotionVectors)
+                        {
+                            // Render to both color and motion RTs
+                            CoreUtils.SetRenderTarget(commandBuffer,
+                                new RenderTargetIdentifier[] { data.GaussianSplatRT, data.GaussianSplatMotionRT },
+                                data.SourceDepth, ClearFlag.None);
+                        }
+                        else
+                        {
+                            // Render only to color RT
+                            CoreUtils.SetRenderTarget(commandBuffer, data.GaussianSplatRT, data.SourceDepth, ClearFlag.None);
+                        }
                     }
                     else
                     {
