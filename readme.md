@@ -9,6 +9,7 @@ This fork originally followed the `stochastic` branch of the original project an
 As a result, this is a portability-focused fork primarily targeting WebGPU with high visual fidelity splat rendering that works well on constrained / upcoming WebGPU platforms. To maximize compatibility on Web and WASM, the implementation favors CPU-side hierarchical culling and small per-node sorts (which run in parallel when available) rather than relying on large, complex GPU-only global sorts.
 
 Edit: Not until later I realise WASM thread is not available in Unity C# at the moment, so parellel sort doesn't work in WebGPU at all(sad), then why the heck it looks visually fast? I've no idea to to this, maybe the sort overhead is much less than I'd thought? Or the cache node optimization is very good here?
+The only path for parelleling right now is experimental native C++ thread support, which is under development.
 
 ## Highlights
 - Hierarchical octree build (configurable depth & leaf capacity) + outlier bucket.
