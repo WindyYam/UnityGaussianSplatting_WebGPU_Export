@@ -4,16 +4,10 @@
 
 A WebGPU-focused fork of [aras-p/UnityGaussianSplatting](https://github.com/aras-p/UnityGaussianSplatting) optimized for high-fidelity Gaussian splat rendering on web platforms and constrained environments.
 
-**Key Features:**
-- WebGPU-first design with hierarchical CPU-side culling and sorting
-- Cross-platform threading: native threading on WebGL, Unity Tasks on desktop
-- Non-blocking parallel sorting with octree optimization
-- High visual fidelity without GPU compute shader dependencies
-
 > Note on development: This repository originally followed the `stochastic` branch of the upstream project to investigate a GPU sort-free solution. Due to visible noise introduced by stochastic alpha blending, the project shifted to a CPU + octree-based sorting approach for more deterministic, high-fidelity results.
 
 ## Features
-- **Cross-platform threading**: Native threading on WebGL, Unity Tasks on desktop
+- **Cross-platform threading**: Native threading on WebGL(C# runtime doesn't support threading yet on Unity), C# Tasks on desktop
 - **Hierarchical octree** with configurable depth and outlier filtering
 - **Frustum culling** reduces processing overhead
 - **Non-blocking sorts**: Parallel sorting never blocks rendering
