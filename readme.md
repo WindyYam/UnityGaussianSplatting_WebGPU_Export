@@ -10,12 +10,15 @@ A WebGPU-focused fork of [aras-p/UnityGaussianSplatting](https://github.com/aras
 - Non-blocking parallel sorting with octree optimization
 - High visual fidelity without GPU compute shader dependencies
 
+> Note on development: This repository originally followed the `stochastic` branch of the upstream project to investigate a GPU sort-free solution. Due to visible noise introduced by stochastic alpha blending, the project shifted to a CPU + octree-based sorting approach for more deterministic, high-fidelity results.
+
 ## Features
 - **Cross-platform threading**: Native threading on WebGL, Unity Tasks on desktop
 - **Hierarchical octree** with configurable depth and outlier filtering
 - **Frustum culling** reduces processing overhead
 - **Non-blocking sorts**: Parallel sorting never blocks rendering
-- **Distance-based ordering**: Efficient camera rotation without re-sorting
+- **Distance-based ordering**: Efficient camera rotation without re-sorting compare to camera front based sorting
+- **Cacheable node sort results**: Sort order for distant octree nodes is cached and reused across small camera movements, avoiding unnecessary re-sorts and improving frame performance. This is a key benefit of the approach — distant nodes whose relative order doesn't change significantly can use cached results to reduce CPU work.
 
 ## Quick Start
 1. **Import splat assets** (PLY/SPZ) using the editor tooling
