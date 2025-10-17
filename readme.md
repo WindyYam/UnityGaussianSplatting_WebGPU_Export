@@ -7,7 +7,7 @@ A WebGPU-focused fork of [aras-p/UnityGaussianSplatting](https://github.com/aras
 > Note on development: This repository originally followed the `stochastic` branch of the upstream project to investigate a GPU sort-free solution. Due to visible noise introduced by stochastic alpha blending, the project shifted to a CPU + octree-based sorting approach for more deterministic, high-fidelity results.
 
 ## Features
-- **Cross-platform threading**: Native threading on WebGL(C# runtime doesn't support threading yet on Unity), C# Tasks on desktop
+- **Cross-platform threading**: Native threading on WebGPU(C# runtime doesn't support threading yet on Unity), C# Tasks on desktop
 - **Hierarchical octree** with configurable depth and outlier filtering
 - **Frustum culling** reduces processing overhead
 - **Non-blocking sorts**: Parallel sorting never blocks rendering
@@ -16,18 +16,18 @@ A WebGPU-focused fork of [aras-p/UnityGaussianSplatting](https://github.com/aras
 
 ## Quick Start
 1. **Import splat assets** (PLY/SPZ) using the editor tooling
-2. **Configure octree** settings (`maxDepth`, `maxSplatsPerLeaf`) - aim for ~1024 splats per leaf
+2. **Configure octree** settings (`maxDepth`, `maxSplatsPerLeaf`) - aim for depth ~6 and ~2048 splats per leaf
 3. **Enable Draw Gizmos** in settings to visualize octree bounds and tune parameters
-4. **For WebGL**: Enable "Native C++ Threads Support" in Unity WebGL settings and serve with CORS headers (use included `serve.py`)
+4. **For WebGPU**: Enable "Native C++ Threads Support" in Unity WebGPU settings and serve with CORS headers (use included `serve.py`)
 
 The system automatically builds an octree, filters outliers, and performs frustum culling and parallel sorting each frame.
 
 **Try the example**: The GaussianExample-URP package includes a "Barangaroo" scene.
 
-## WebGL Setup
-For WebGL threading support (required for optimal performance):
+## WebGPU Setup
+For WebGPU threading support (required for optimal performance):
 
-1. **Unity Settings**: Enable "Native C++ Threads Support" in Project Settings > WebGL Settings
+1. **Unity Settings**: Enable "Native C++ Threads Support" in Project Settings > WebGPU Settings
 2. **Web Server**: Serve with CORS headers for SharedArrayBuffer support:
    ```bash
    python serve.py  # Use included script for local testing
@@ -39,20 +39,20 @@ For WebGL threading support (required for optimal performance):
    ```
 3. **Browser Support**: Modern browsers (Chrome 68+, Firefox 79+, Safari 15.2+)
 
+> Note: Even if you do not use C++/WASM threads, the sequential path is still remarkably good thanks to the cachable node sort result and distributed sort work over frames.
+
 Desktop platforms use Unity's Task system by default (no additional setup required).
 
 ## Configuration
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `maxDepth` | 8 | Octree depth (aim for ~1024 splats per leaf) |
-| `maxSplatsPerLeaf` | 1024 | Maximum splats per octree leaf |
-| `enableParallelSorting` | true | Enable multi-threaded sorting (fallback to sequential sort over frames when no thread support in the build) |
-| `parallelSortThreads` | auto | Worker thread count (auto-detected)
+| `maxDepth` | 6 | Octree depth(to limit frustum AABB tests number) |
+| `maxSplatsPerLeaf` | 2048 | Maximum splats per octree leaf (if not reached maxDepth yet) |
 
 ## Performance Tips
-- Start with `maxDepth = 8` and `maxSplatsPerLeaf = 1024` for most scenes
+- Start with `maxDepth = 6` and `maxSplatsPerLeaf = 2048` for most scenes
 - Tune "scene splat ratio" (0.90-0.95) to filter distant noise into outlier bucket
-- Check browser console for "SharedArrayBuffer is defined: true" on WebGL
+- Check browser console for "WebGL platform — using native threading" on WebGPU
 - Optional: Compile native libraries for maximum desktop performance (see `docs/`)
 
 ## License

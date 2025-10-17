@@ -435,18 +435,30 @@ namespace GaussianSplatting.Runtime
                 // Choose a color format that matches the active color space: use sRGB format when in Gamma, linear format when in Linear.
                 GraphicsFormat colorGfxFormat = GraphicsFormat.R16G16B16A16_SFloat;
                 // Motion needs a linear floating format (no sRGB) - use RGBA format for WebGPU compatibility
-                GraphicsFormat motionGfxFormat = GraphicsFormat.R16G16B16A16_SFloat;
+                GraphicsFormat motionGfxFormat = GraphicsFormat.R8G8B8A8_UNorm;
 
                 // Ensure persistent RTs exist and match requested size/format to avoid per-frame allocation
                 EnsurePersistentRenderTextures(rtW, rtH, colorGfxFormat, motionGfxFormat);
 
-                // Bind persistent RTs into the command buffer and set as active targets
-                var rtIds = new RenderTargetIdentifier[] { new RenderTargetIdentifier(m_PersistentColorRT), new RenderTargetIdentifier(m_PersistentMotionRT) };
-                m_CommandBuffer.SetRenderTarget(rtIds, BuiltinRenderTextureType.CurrentActive);
+                var needsMotionVectors = settings.m_TemporalFilter != TemporalFilter.None; // Only for alpha cutout
+
+                if (needsMotionVectors)
+                {
+                    // Bind persistent RTs into the command buffer and set as active targets
+                    var rtIds = new RenderTargetIdentifier[] { new RenderTargetIdentifier(m_PersistentColorRT), new RenderTargetIdentifier(m_PersistentMotionRT) };
+                    m_CommandBuffer.SetRenderTarget(rtIds, BuiltinRenderTextureType.CurrentActive);
+                }
+                else
+                {
+                    // Set only the color render target when motion vectors are not needed
+                    m_CommandBuffer.SetRenderTarget(new RenderTargetIdentifier(m_PersistentColorRT));
+                }
+                
                 m_CommandBuffer.ClearRenderTarget(RTClearFlags.Color, new Color(0, 0, 0, 0), 0, 0);
 
                 // Also set global texture bindings so subsequent passes/shaders can sample them by name
                 m_CommandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.GaussianSplatRT, m_PersistentColorRT);
+
                 m_CommandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.GaussianSplatMotionRT, m_PersistentMotionRT);
              }
 
