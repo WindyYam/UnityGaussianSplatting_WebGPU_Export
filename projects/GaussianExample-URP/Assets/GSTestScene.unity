@@ -624,8 +624,8 @@ MonoBehaviour:
   m_PointDisplaySize: 5
   m_SHOnly: 0
   m_EnableOctreeCulling: 1
-  m_OctreeMaxDepth: 8
-  m_OctreeMaxSplatsPerLeaf: 1024
+  m_OctreeMaxDepth: 6
+  m_OctreeMaxSplatsPerLeaf: 2048
   m_OctreeCullingUpdateInterval: 2
   m_OctreeSplatRatio: 0.9
   m_DrawOctreeGizmos: 1
