@@ -434,8 +434,8 @@ namespace GaussianSplatting.Runtime
                 int rtH = cam.pixelHeight;
                 // Choose a color format that matches the active color space: use sRGB format when in Gamma, linear format when in Linear.
                 GraphicsFormat colorGfxFormat = GraphicsFormat.R16G16B16A16_SFloat;
-                // Motion needs a linear floating format (no sRGB) - use RGBA format for WebGPU compatibility
-                GraphicsFormat motionGfxFormat = GraphicsFormat.R8G8B8A8_UNorm;
+                // Motion needs a linear floating format (no sRGB)
+                GraphicsFormat motionGfxFormat = GraphicsFormat.R16G16_SFloat;
 
                 // Ensure persistent RTs exist and match requested size/format to avoid per-frame allocation
                 EnsurePersistentRenderTextures(rtW, rtH, colorGfxFormat, motionGfxFormat);
