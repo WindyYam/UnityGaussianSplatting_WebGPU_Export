@@ -77,7 +77,12 @@ namespace GaussianSplatting.Runtime
         }
 
         // Reusable list for visible node references during sorting
-        readonly List<VisibleNodeRef> m_VisibleNodeRefs = new();        // Enable / disable parallel sorting (public for runtime tuning)
+        readonly List<VisibleNodeRef> m_VisibleNodeRefs = new();
+        
+        // Reusable stack for non-recursive octree traversal
+        readonly Stack<int> m_TraversalStack = new();
+        
+        // Enable / disable parallel sorting (public for runtime tuning)
         public bool enableParallelSorting = true;
         // Configurable number of worker threads for node sorting (excluding main thread)
         public int parallelSortThreads = 8; // Default sort threads, Safe for most of the platform
@@ -863,6 +868,7 @@ namespace GaussianSplatting.Runtime
                 m_VisibleSplatIndicesValid = false;
             }
             m_VisibleNodeRefs.Clear();
+            m_TraversalStack.Clear(); // Clear the reusable stack
             m_VisibleIndicesBuffer?.Dispose();
             m_VisibleIndicesBuffer = null;
             m_DistanceSortArray = null; // Release sort array memory
@@ -1626,32 +1632,56 @@ namespace GaussianSplatting.Runtime
 
         void CollectVisibleNodesWithDistance(int nodeIndex, Plane[] frustumPlanes, Vector3 camPosition)
         {
+            m_TraversalStack.Clear();
+            
+            // Early exit if invalid starting node
             if (nodeIndex >= m_Nodes.Count)
                 return;
-            var node = m_Nodes[nodeIndex];
-            if (!GeometryUtility.TestPlanesAABB(frustumPlanes, node.bounds))
-                return;
-            if (node.isLeaf)
+                
+            m_TraversalStack.Push(nodeIndex);
+            
+            while (m_TraversalStack.Count > 0)
             {
-                if (node.splatIndices != null && node.splatIndices.Count > 0)
+                int currentNodeIndex = m_TraversalStack.Pop();
+                
+                // Bounds check
+                if (currentNodeIndex >= m_Nodes.Count)
+                    continue;
+                    
+                var node = m_Nodes[currentNodeIndex];
+                
+                // Frustum culling - early exit if node not visible
+                if (!GeometryUtility.TestPlanesAABB(frustumPlanes, node.bounds))
+                    continue;
+                
+                if (node.isLeaf)
                 {
-                    float nodeDistance = (node.center - camPosition).sqrMagnitude;
-                    m_VisibleNodeRefs.Add(new VisibleNodeRef
+                    // Add leaf node if it has splats
+                    if (node.splatIndices != null && node.splatIndices.Count > 0)
                     {
-                        distance = nodeDistance,
-                        nodeIndex = nodeIndex
-                    });
+                        float nodeDistance = (node.center - camPosition).sqrMagnitude;
+                        m_VisibleNodeRefs.Add(new VisibleNodeRef
+                        {
+                            distance = nodeDistance,
+                            nodeIndex = currentNodeIndex
+                        });
+                    }
                 }
-            }
-            else if (node.childIndices != null)
-            {
-                foreach (var childIndex in node.childIndices)
+                else if (node.childIndices != null)
                 {
-                    if (childIndex < m_Nodes.Count)
+                    // Add children to stack for traversal (reverse order for consistent traversal)
+                    for (int i = node.childIndices.Count - 1; i >= 0; i--)
                     {
-                        var childNode = m_Nodes[childIndex];
-                        if ((childNode.splatIndices != null && childNode.splatIndices.Count > 0) || !childNode.isLeaf)
-                            CollectVisibleNodesWithDistance(childIndex, frustumPlanes, camPosition);
+                        int childIndex = node.childIndices[i];
+                        if (childIndex < m_Nodes.Count)
+                        {
+                            var childNode = m_Nodes[childIndex];
+                            // Only traverse children that have content or are internal nodes
+                            if ((childNode.splatIndices != null && childNode.splatIndices.Count > 0) || !childNode.isLeaf)
+                            {
+                                m_TraversalStack.Push(childIndex);
+                            }
+                        }
                     }
                 }
             }
