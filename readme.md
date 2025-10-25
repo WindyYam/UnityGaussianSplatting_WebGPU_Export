@@ -46,11 +46,11 @@ Desktop platforms use Unity's Task system by default (no additional setup requir
 ## Configuration
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `maxDepth` | 6 | Octree depth(to limit frustum AABB tests number) |
-| `maxSplatsPerLeaf` | 2048 | Maximum splats per octree leaf (if not reached maxDepth yet) |
+| `maxDepth` | 5 | Octree depth(to limit frustum AABB tests number) |
+| `maxSplatsPerLeaf` | 1 | Maximum splats per octree leaf (if not reached maxDepth yet) |
 
 ## Performance Tips
-- Start with `maxDepth = 6` and `maxSplatsPerLeaf = 2048` for most scenes.
+- Start with `maxDepth = 5` and `maxSplatsPerLeaf = 2048` for most scenes.
 - For cases sensitive to node-wise distance sort error (large-node vs small-node ordering artifacts), prefer an even spatial split: set `maxSplatsPerLeaf = 1` to force uniform splitting down to `maxDepth`. This reduces inter-node ordering error at the cost of more leaves and higher CPU/memory overhead.
 - Tune "scene splat ratio" (0.90-0.95) to filter distant noise into outlier bucket
 - Check browser console for "WebGL platform — using native threading" on WebGPU
