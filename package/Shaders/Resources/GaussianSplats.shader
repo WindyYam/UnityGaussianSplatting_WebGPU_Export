@@ -122,6 +122,14 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
     float2 axis1, axis2;
     DecomposeCovariance(cov2d, axis1, axis2);
     
+    // Early discard if splat is smaller than one pixel
+    float splatRadius = max(length(axis1), length(axis2));
+    if (splatRadius < 0.5)
+    {
+        o.vertex = asfloat(0x7fc00000); // NaN discards the primitive
+        return o;
+    }
+    
     // Calculate color using spherical harmonics
     float3 worldViewDir = _VecWorldSpaceCameraPos.xyz - centerWorldPos;
     float3 objViewDir = mul((float3x3)_MatrixWorldToObject, worldViewDir);
