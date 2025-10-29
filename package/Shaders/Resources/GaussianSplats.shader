@@ -278,14 +278,13 @@ FragOut frag (v2f i)
         if (alpha <= cutoff)
             discard;
         alpha = 1;
-        o.motion = half4(i.vel, 0, 0); // Use xy for motion vectors, zw unused for WebGPU compatibility
     }
     else // sgu_transparencyMode == 1 (AlphaBlend)
     {
         i.col.rgb *= alpha; // premultiply
         // This mode will require proper depth sorting for correct results
     }
-
+    o.motion = half4(i.vel, 0, 0); // Use xy for motion vectors, zw unused for WebGPU compatibility
     o.col = half4(i.col.rgb, alpha);
     return o;
 }

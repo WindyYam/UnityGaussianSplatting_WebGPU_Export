@@ -99,10 +99,8 @@ namespace GaussianSplatting.Runtime
                         // bind both color and motion targets as global textures
                         commandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.GaussianSplatRT, data.GaussianSplatRT);
                         commandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.GaussianSplatMotionRT, data.GaussianSplatMotionRT);
-                        // render to both color and motion RTs
-                        var needsMotionVectors = settings.m_TemporalFilter != TemporalFilter.None; // Only for alpha cutout
-
-                        if (needsMotionVectors)
+                        
+                        if (settings.m_TemporalFilter != TemporalFilter.None)
                         {
                             // Render to both color and motion RTs
                             CoreUtils.SetRenderTarget(commandBuffer,

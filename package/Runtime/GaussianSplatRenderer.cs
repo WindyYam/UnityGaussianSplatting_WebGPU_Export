@@ -823,8 +823,12 @@ namespace GaussianSplatting.Runtime
             }
             else
             {
-                // For other modes, use regular culling only
-                return m_Octree.CullFrustum(camera);
+                // For stochastic modes, use regular culling only
+                //return m_Octree.CullFrustum(camera);
+                // Believe it or not, front to back sort with stochastic mode will make framerate even higher
+                // The overdraw will be minimal
+                m_Octree.SortVisibleSplatsByDepth(camera);
+                return m_Octree.visibleSplatCount;
             }
         }
 
